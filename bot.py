@@ -80,12 +80,12 @@ class Config:
         log_dir = data_dir / "logs"
         return cls(
             base_url=os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com").rstrip("/"),
-            api_key=os.getenv("ROOSTOO_API_KEY", ""),
-            api_secret=os.getenv("ROOSTOO_API_SECRET", ""),
+            api_key=os.getenv("ROOSTOO_API_KEY", "YZJpIGyMhk1efgdP8qZM0LTZZ2eFJh35ovWByPgSG73XS5OeWruM8XygCqHypBK7"),
+            api_secret=os.getenv("ROOSTOO_API_SECRET", "PTtlKF7Vwed7MfiUCz6G6PySVDH5zP8Vjz4lmIYuxQyrjq5EvseYAJV3jAhVnYyK"),
             bot_name=os.getenv("BOT_NAME", "roostoo_prelim_bot"),
             poll_seconds=int(os.getenv("POLL_SECONDS", "60")),
             lookback_minutes=int(os.getenv("LOOKBACK_MINUTES", "360")),
-            min_history=int(os.getenv("MIN_HISTORY", "75")),
+            min_history=int(os.getenv("MIN_HISTORY", "10")),
             data_dir=data_dir,
             log_dir=log_dir,
             state_file=data_dir / "state.json",
@@ -107,11 +107,11 @@ class Config:
             spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.006")),
             min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "50000")),
             max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.05")),
-            market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0015")),
-            market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.55")),
+            market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0005")),
+            market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.52")),
             regime_exit_median_60m_threshold=float(os.getenv("REGIME_EXIT_MEDIAN_60M_THRESHOLD", "0.0005")),
             regime_exit_up_ratio_threshold=float(os.getenv("REGIME_EXIT_UP_RATIO_THRESHOLD", "0.48")),
-            market_positive_score_ratio_threshold=float(os.getenv("MARKET_POSITIVE_SCORE_RATIO_THRESHOLD", "0.50")),
+            market_positive_score_ratio_threshold=float(os.getenv("MARKET_POSITIVE_SCORE_RATIO_THRESHOLD", "0.45")),
             regime_exit_positive_score_ratio_threshold=float(os.getenv("REGIME_EXIT_POSITIVE_SCORE_RATIO_THRESHOLD", "0.42")),
             vol_floor=float(os.getenv("VOL_FLOOR", "0.004")),
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
@@ -120,13 +120,13 @@ class Config:
             per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.045")),
             max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
-            request_timeout=int(os.getenv("REQUEST_TIMEOUT", "20")),
-            max_retries=int(os.getenv("MAX_RETRIES", "3")),
+            request_timeout=int(os.getenv("REQUEST_TIMEOUT", "5")),
+            max_retries=int(os.getenv("MAX_RETRIES", "1")),
             retry_sleep_seconds=float(os.getenv("RETRY_SLEEP_SECONDS", "1.5")),
             order_failure_pause_seconds=int(os.getenv("ORDER_FAILURE_PAUSE_SECONDS", "180")),
             loop_error_backoff_cap_seconds=int(os.getenv("LOOP_ERROR_BACKOFF_CAP_SECONDS", "900")),
             cancel_all_on_start=env_bool("CANCEL_ALL_ON_START", False),
-            dry_run=env_bool("DRY_RUN", False),
+            dry_run=env_bool("DRY_RUN", True),
         )
 
 
@@ -302,6 +302,7 @@ class RoostooMomentumBot:
         self._pause_until_ms = 0
         self._consecutive_loop_failures = 0
         self._has_lock = False
+        self.last_rebalance_ts = 0
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
         self.acquire_instance_lock()
@@ -426,7 +427,7 @@ class RoostooMomentumBot:
         if not response.get("Success", False):
             raise RuntimeError(f"Balance fetch failed: {response}")
         wallet: Dict[str, Dict[str, float]] = {}
-        for coin, value in response.get("Wallet", {}).items():
+        for coin, value in response.get("SpotWallet", {}).items():
             wallet[coin] = {"Free": safe_float(value.get("Free")), "Lock": safe_float(value.get("Lock"))}
         return wallet
 
@@ -812,6 +813,14 @@ class RoostooMomentumBot:
             self.set_cooldown(pair, self.cfg.cooldown_minutes)
 
     def rebalance_once(self) -> None:
+        now = time.time()
+
+        # cooldown
+        cooldown_seconds = 300  # 5分钟（推荐）
+
+        if now - self.last_rebalance_ts < cooldown_seconds:
+            logger.info("Cooldown active, skipping rebalance.")
+            return
         tickers = self.fetch_all_tickers()
         self.update_history(tickers)
 
@@ -821,6 +830,7 @@ class RoostooMomentumBot:
             logger.warning("Portfolio kill switch triggered.")
             self.exit_all_positions(portfolio.positions, tickers, "portfolio_drawdown")
             self.persist_runtime_state()
+            self.last_rebalance_ts = now
             return
 
         signals = self.strategy.generate_signals(
@@ -831,11 +841,17 @@ class RoostooMomentumBot:
         )
         self.state.risk_on = signals["risk_on"]
         self.log_signal_snapshot(signals)
-        logger.info("Regime risk_on=%s targets=%s", signals["risk_on"], signals["weights"])
+        logger.info(
+            "Regime=%s risk=%.2f targets=%s",
+            signals["regime"]["regime"],
+            signals["regime"]["risk_multiplier"],
+            signals["weights"]
+        )
 
         if not signals["features"]:
             logger.info("Not enough history yet.")
             self.persist_runtime_state()
+            self.last_rebalance_ts = now
             return
 
         self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
@@ -849,6 +865,7 @@ class RoostooMomentumBot:
         self.sync_position_meta(portfolio.positions, tickers)
         self.add_target_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
         self.persist_runtime_state()
+        self.last_rebalance_ts = now
 
     def run_forever(self) -> None:
         self.bootstrap()

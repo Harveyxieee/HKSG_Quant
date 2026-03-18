@@ -57,10 +57,145 @@ class MarketSnapshot:
     positive_score_ratio: float = 0.0
     avg_score: float = 0.0
 
+# =========================
+# REGIME FILTER（内嵌版）
+# =========================
+from collections import deque
+import numpy as np
+import pandas as pd
+
+class RegimeFilter:
+    def __init__(self, symbols, btc_symbol="BTC/USD", maxlen=200):
+        self.symbols = symbols
+        self.btc_symbol = btc_symbol
+        self.price_history = {s: deque(maxlen=maxlen) for s in symbols}
+        self.current_regime = None
+
+    def update_market_data(self, tickers):
+        for symbol in self.symbols:
+            if symbol in tickers:
+                price = tickers[symbol].get("LastPrice", 0)
+                if price > 0:
+                    self.price_history[symbol].append(float(price))
+
+    def _to_df(self):
+        df = pd.DataFrame({k: list(v) for k, v in self.price_history.items()})
+        return df.ffill().dropna(how="all")
+
+    def detect_regime(self):
+        price_df = self._to_df()
+
+        if self.btc_symbol not in price_df or len(price_df[self.btc_symbol]) < 10:
+            self.current_regime = {
+                "regime": "neutral",
+                "risk_multiplier": 0.5,
+            }
+            return self.current_regime
+
+        returns_df = price_df.pct_change()
+
+        # ===== BTC TREND =====
+        btc_price = price_df[self.btc_symbol]
+        ma = btc_price.rolling(min(50, len(btc_price))).mean()
+        if len(btc_price) < 10 or np.isnan(ma.iloc[-1]):
+            self.current_regime = {
+                "regime": "neutral",
+                "risk_multiplier": 0.5,
+            }
+            return self.current_regime
+        btc_trend = btc_price.iloc[-1] / ma.iloc[-1] - 1
+
+        # ===== VOL =====
+        btc_returns = returns_df[self.btc_symbol]
+        vol = btc_returns.rolling(min(20, len(btc_returns))).std()
+        vol_window = vol.dropna()
+
+        if len(vol_window) < 20:
+            vol_pct = 0.5
+        else:
+            current = vol.iloc[-1]
+            vol_pct = (vol_window < current).mean()
+
+        # ===== BREADTH =====
+        latest_returns = returns_df.iloc[-1].dropna()
+        if len(latest_returns) == 0:
+            return self.current_regime or {"regime": "neutral", "risk_multiplier": 0.5}
+        breadth = (latest_returns > 0).mean()
+
+        # ===== SCORE =====
+        score = 0
+
+        if btc_trend > 0.01:
+            score += 2
+        elif btc_trend > 0.002:
+            score += 1
+        elif btc_trend < -0.01:
+            score -= 2
+        elif btc_trend < -0.002:
+            score -= 1
+
+        if breadth > 0.6:
+            score += 1
+        if breadth < 0.3:
+            score -= 1
+
+        if latest_returns.mean() > 0:
+            score += 1
+
+        if vol_pct > 0.95:
+            score -= 2
+        elif vol_pct > 0.8:
+            score -= 1
+
+        prev = self.current_regime["regime"] if self.current_regime else "neutral"
+
+        prev = self.current_regime["regime"] if self.current_regime else "neutral"
+
+        # ===== PANIC 优先级最高 =====
+        if vol_pct > 0.97:
+            regime = "panic"
+
+        # ===== TREND（带滞后）=====
+        elif prev == "trend":
+            if score >= 1:  # 👈 从2降到1（更容易维持）
+                regime = "trend"
+            else:
+                regime = "neutral"
+
+        # ===== RANGE（带滞后）=====
+        elif prev == "range":
+            if score <= 0:  # 👈 从-1放宽到0
+                regime = "range"
+            else:
+                regime = "neutral"
+
+        # ===== 新进入状态（严格）=====
+        else:
+            if score >= 2:
+                regime = "trend"
+            elif score <= -1:
+                regime = "range"
+            else:
+                regime = "neutral"
+
+        mapping = {
+            "trend": 1.0,
+            "neutral": 0.6,
+            "range": 0.5,
+            "panic": 0.2,
+        }
+
+        self.current_regime = {
+            "regime": regime,
+            "risk_multiplier": mapping[regime],
+        }
+
+        return self.current_regime
 
 class MomentumStrategy:
     def __init__(self, cfg: Any):
         self.cfg = cfg
+        self.regime_filter = None
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -108,13 +243,20 @@ class MomentumStrategy:
             if pair not in trade_pairs or len(series) < self.cfg.min_history:
                 continue
             prices = [entry["price"] for entry in series]
+            if len(prices) < 2:
+                continue
             price = prices[-1]
             returns_1m = []
-            for offset in range(1, 61):
+            max_lookback = min(60, len(prices) - 1)
+
+            for offset in range(1, max_lookback + 1):
                 current = prices[-offset]
                 previous = prices[-offset - 1]
                 if previous > 0:
                     returns_1m.append(current / previous - 1.0)
+
+            if len(prices) < 20:
+                continue
             ma20 = mean(prices[-20:])
             high20 = max(prices[-20:])
             low20 = min(prices[-20:])
@@ -246,15 +388,59 @@ class MomentumStrategy:
         history: Dict[str, Deque[Dict[str, float]]],
         trade_pairs: Dict[str, Dict[str, Any]],
         positions: Dict[str, float],
-        prev_risk_on: bool,
+        prev_risk_on:
+        bool,
     ) -> Dict[str, Any]:
+        # ===== 初始化 Regime =====
+        if self.regime_filter is None:
+            symbols = [pair for pair in history if len(history[pair]) > 0]
+            self.regime_filter = RegimeFilter(symbols)
+
+        # 用当前价格更新
+        latest_tickers = {
+            pair: {"LastPrice": history[pair][-1]["price"]}
+            for pair in history
+            if len(history[pair]) > 0
+        }
+
+        self.regime_filter.update_market_data(latest_tickers)
+        regime = self.regime_filter.detect_regime()
+
         features = self.compute_features(history, trade_pairs)
         snapshot = self.market_snapshot(features)
-        risk_on = self.risk_on(snapshot, prev_risk_on)
+        risk_on = regime["regime"] in ["trend", "neutral"]
         weights = self.target_weights(features, risk_on, positions)
+
+        # range 不清仓
+        regime_name = regime["regime"]
+
+        if regime_name == "range" and positions:
+            # 保留已有仓位，按小仓位分配
+            n = len(positions)
+            if n > 0:
+                weights = {
+                    p: min(self.cfg.max_single_weight, 0.3 / n)
+                    for p in positions
+                }
+        # ===== Regime 控制仓位（核心）=====
+        if weights:
+            if regime_name == "range":
+                multiplier = 1.0
+            elif regime_name == "neutral":
+                multiplier = 0.6
+            elif regime_name == "trend":
+                multiplier = 1.0
+            else:  # panic
+                multiplier = 0.0
+
+            total = sum(weights.values())
+            if total > 0:
+                weights = {p: w / total * self.cfg.target_gross_exposure * multiplier for p, w in weights.items()}
+
         return {
             "features": features,
             "snapshot": snapshot,
             "risk_on": risk_on,
             "weights": weights,
+            "regime": regime,
         }

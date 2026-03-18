@@ -178,3 +178,4 @@ class RoostooClient:
         if order_id:
             payload["order_id"] = order_id
         return self._request("POST", "/v3/cancel_order", params=payload, signed=True, is_post=True)
+
