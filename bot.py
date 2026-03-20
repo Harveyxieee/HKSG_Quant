@@ -62,10 +62,43 @@ class Config:
     vol_floor: float
     vol_cap: float
     holding_score_bonus: float
+    risk_data_frequency: str
+    risk_min_periods: int
+    risk_return_method: str
+    risk_cov_window: int
+    risk_on_portfolio_vol_threshold: float
+    risk_off_portfolio_vol_threshold: float
+    risk_on_correlation_threshold: float
+    risk_off_correlation_threshold: float
+    risk_vol_score_weight: float
+    risk_corr_score_weight: float
+    risk_on_exposure_multiplier: float
+    neutral_exposure_multiplier: float
+    risk_off_exposure_multiplier: float
+    enable_volatility_targeting: bool
+    target_portfolio_volatility: float
+    min_vol_target_scale: float
+    max_vol_target_scale: float
+    diversification_breakdown_corr_threshold: float
+    diversification_breakdown_exposure_multiplier: float
+    risk_on_weight_penalty_scale: float
+    neutral_weight_penalty_scale: float
+    risk_off_weight_penalty_scale: float
+    risk_weight_vol_penalty: float
+    risk_weight_corr_penalty: float
+    diversification_alt_weight_multiplier: float
+    diversification_core_asset_multiplier: float
+    diversification_core_assets: str
+    high_vol_feature_cutoff_multiplier: float
+    high_vol_feature_weight_multiplier: float
     per_position_stop_loss: float
     per_position_trailing_stop: float
     max_portfolio_drawdown: float
     cooldown_minutes: int
+    startup_warmup_minutes: int
+    max_data_delay_minutes: int
+    min_fresh_points_after_start: int
+    min_fresh_span_minutes: int
     request_timeout: int
     max_retries: int
     retry_sleep_seconds: float
@@ -117,9 +150,52 @@ class Config:
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
             holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.08")),
             per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.035")),
+            risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "1m").strip().lower(),
+            risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "60")),
+            risk_return_method=os.getenv("RISK_RETURN_METHOD", "log").strip().lower(),
+            risk_cov_window=int(os.getenv("RISK_COV_WINDOW", "60")),
+            risk_on_portfolio_vol_threshold=float(os.getenv("RISK_ON_PORTFOLIO_VOL_THRESHOLD", "0.015")),
+            risk_off_portfolio_vol_threshold=float(os.getenv("RISK_OFF_PORTFOLIO_VOL_THRESHOLD", "0.035")),
+            risk_on_correlation_threshold=float(os.getenv("RISK_ON_CORRELATION_THRESHOLD", "0.35")),
+            risk_off_correlation_threshold=float(os.getenv("RISK_OFF_CORRELATION_THRESHOLD", "0.65")),
+            risk_vol_score_weight=float(os.getenv("RISK_VOL_SCORE_WEIGHT", "0.5")),
+            risk_corr_score_weight=float(os.getenv("RISK_CORR_SCORE_WEIGHT", "0.5")),
+            risk_on_exposure_multiplier=float(os.getenv("RISK_ON_EXPOSURE_MULTIPLIER", "1.0")),
+            neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.7")),
+            risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.35")),
+            enable_volatility_targeting=env_bool("ENABLE_VOLATILITY_TARGETING", True),
+            target_portfolio_volatility=float(os.getenv("TARGET_PORTFOLIO_VOLATILITY", "0.020")),
+            min_vol_target_scale=float(os.getenv("MIN_VOL_TARGET_SCALE", "0.35")),
+            max_vol_target_scale=float(os.getenv("MAX_VOL_TARGET_SCALE", "1.20")),
+            diversification_breakdown_corr_threshold=float(
+                os.getenv("DIVERSIFICATION_BREAKDOWN_CORR_THRESHOLD", "0.75")),
+            diversification_breakdown_exposure_multiplier=float(
+                os.getenv("DIVERSIFICATION_BREAKDOWN_EXPOSURE_MULTIPLIER", "0.75")),
+            risk_on_weight_penalty_scale=float(os.getenv("RISK_ON_WEIGHT_PENALTY_SCALE", "0.10")),
+            neutral_weight_penalty_scale=float(os.getenv("NEUTRAL_WEIGHT_PENALTY_SCALE", "0.25")),
+            risk_off_weight_penalty_scale=float(os.getenv("RISK_OFF_WEIGHT_PENALTY_SCALE", "0.50")),
+            risk_weight_vol_penalty=float(os.getenv("RISK_WEIGHT_VOL_PENALTY", "1.0")),
+            risk_weight_corr_penalty=float(os.getenv("RISK_WEIGHT_CORR_PENALTY", "1.0")),
+            diversification_alt_weight_multiplier=float(
+                os.getenv("DIVERSIFICATION_ALT_WEIGHT_MULTIPLIER", "0.85")
+            ),
+            diversification_core_asset_multiplier=float(
+                os.getenv("DIVERSIFICATION_CORE_ASSET_MULTIPLIER", "1.15")
+            ),
+            diversification_core_assets=os.getenv("DIVERSIFICATION_CORE_ASSETS", "BTC,ETH"),
+            high_vol_feature_cutoff_multiplier=float(
+                os.getenv("HIGH_VOL_FEATURE_CUTOFF_MULTIPLIER", "0.85")
+            ),
+            high_vol_feature_weight_multiplier=float(
+                os.getenv("HIGH_VOL_FEATURE_WEIGHT_MULTIPLIER", "0.80")
+            ),
             per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.045")),
             max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
+            startup_warmup_minutes=int(os.getenv("STARTUP_WARMUP_MINUTES", "30")),
+            max_data_delay_minutes=int(os.getenv("MAX_DATA_DELAY_MINUTES", "2")),
+            min_fresh_points_after_start=int(os.getenv("MIN_FRESH_POINTS_AFTER_START", "30")),
+            min_fresh_span_minutes=int(os.getenv("MIN_FRESH_SPAN_MINUTES", "30")),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "5")),
             max_retries=int(os.getenv("MAX_RETRIES", "1")),
             retry_sleep_seconds=float(os.getenv("RETRY_SLEEP_SECONDS", "1.5")),
@@ -275,6 +351,8 @@ def load_history() -> Dict[str, Deque[Dict[str, float]]]:
                         "ask": safe_float(row.get("ask")),
                         "change_24h": safe_float(row.get("change_24h")),
                         "unit_trade_value": safe_float(row.get("unit_trade_value")),
+                        "quote_volume": safe_float(row.get("quote_volume", row.get("unit_trade_value"))),
+                        "base_volume": safe_float(row.get("base_volume")),
                     }
                 )
             if restored:
@@ -303,6 +381,7 @@ class RoostooMomentumBot:
         self._consecutive_loop_failures = 0
         self._has_lock = False
         self.last_rebalance_ts = 0
+        self.session_start_ts = now_ms()
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
         self.acquire_instance_lock()
@@ -419,8 +498,70 @@ class RoostooMomentumBot:
                     "ask": safe_float(ticker.get("MinAsk")),
                     "change_24h": safe_float(ticker.get("Change")),
                     "unit_trade_value": safe_float(ticker.get("UnitTradeValue")),
+                    "quote_volume": safe_float(ticker.get("UnitTradeValue")),
+                    "base_volume": safe_float(ticker.get("CoinTradeValue")),
                 }
             )
+
+    def freshness_reference_pair(self) -> Optional[str]:
+        if "BTC/USD" in self.trade_pairs:
+            return "BTC/USD"
+        if self.trade_pairs:
+            return sorted(self.trade_pairs.keys())[0]
+        return None
+
+    def latest_history_ts(self, pair: Optional[str] = None) -> int:
+        if pair:
+            series = self.history.get(pair)
+            if series:
+                return int(series[-1].get("ts", 0))
+            return 0
+
+        latest_ts = 0
+        for series in self.history.values():
+            if not series:
+                continue
+            latest_ts = max(latest_ts, int(series[-1].get("ts", 0)))
+        return latest_ts
+
+    def fresh_points_after_start(self, pair: str) -> List[Dict[str, float]]:
+        series = self.history.get(pair, deque())
+        return [row for row in series if int(row.get("ts", 0)) >= self.session_start_ts]
+
+    def history_is_fresh_enough(self) -> tuple[bool, str]:
+        ref_pair = self.freshness_reference_pair()
+        if ref_pair is None:
+            return False, "no_reference_pair"
+
+        latest_ts = self.latest_history_ts(ref_pair)
+        if latest_ts <= 0:
+            return False, f"{ref_pair}:no_history"
+
+        delay_ms = now_ms() - latest_ts
+        if delay_ms > self.cfg.max_data_delay_minutes * 60_000:
+            return False, (
+                f"{ref_pair}:stale_latest delay_min={delay_ms / 60_000:.1f} "
+                f"limit={self.cfg.max_data_delay_minutes}"
+            )
+
+        fresh_rows = self.fresh_points_after_start(ref_pair)
+        if len(fresh_rows) < self.cfg.min_fresh_points_after_start:
+            return False, (
+                f"{ref_pair}:insufficient_fresh_points count={len(fresh_rows)} "
+                f"need={self.cfg.min_fresh_points_after_start}"
+            )
+
+        fresh_span_ms = int(fresh_rows[-1]["ts"] - fresh_rows[0]["ts"]) if len(fresh_rows) >= 2 else 0
+        if fresh_span_ms < self.cfg.min_fresh_span_minutes * 60_000:
+            return False, (
+                f"{ref_pair}:insufficient_fresh_span span_min={fresh_span_ms / 60_000:.1f} "
+                f"need={self.cfg.min_fresh_span_minutes}"
+            )
+
+        return True, (
+            f"{ref_pair}:fresh ok latest_delay_min={delay_ms / 60_000:.1f} "
+            f"fresh_points={len(fresh_rows)} span_min={fresh_span_ms / 60_000:.1f}"
+        )
 
     def get_wallet(self) -> Dict[str, Dict[str, float]]:
         response = self.client.balance()
@@ -617,6 +758,8 @@ class RoostooMomentumBot:
                     {
                         "risk_on": signals["risk_on"],
                         "market": asdict(signals["snapshot"]),
+                        "portfolio_risk": signals.get("portfolio_risk", {}),
+                        "pre_risk_weights": signals.get("pre_risk_weights", {}),
                         "top": top_signals,
                         "targets": signals["weights"],
                     },
@@ -815,17 +958,13 @@ class RoostooMomentumBot:
     def rebalance_once(self) -> None:
         now = time.time()
 
-        # cooldown
-        cooldown_seconds = 300  # 5分钟（推荐）
-
-        if now - self.last_rebalance_ts < cooldown_seconds:
-            logger.info("Cooldown active, skipping rebalance.")
-            return
+        # 1. 每分钟都更新市场数据
         tickers = self.fetch_all_tickers()
         self.update_history(tickers)
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.capture_portfolio_state(portfolio, tickers)
+
         if portfolio.drawdown >= self.cfg.max_portfolio_drawdown:
             logger.warning("Portfolio kill switch triggered.")
             self.exit_all_positions(portfolio.positions, tickers, "portfolio_drawdown")
@@ -841,19 +980,53 @@ class RoostooMomentumBot:
         )
         self.state.risk_on = signals["risk_on"]
         self.log_signal_snapshot(signals)
+
         logger.info(
-            "Regime=%s risk=%.2f targets=%s",
+            "Regime=%s overlay_regime=%s overlay_score=%.2f target_exposure=%.2f "
+            "port_vol=%.4f avg_corr=%.4f pre=%s final=%s",
             signals["regime"]["regime"],
-            signals["regime"]["risk_multiplier"],
-            signals["weights"]
+            signals.get("portfolio_risk", {}).get("market_regime", "unknown"),
+            signals.get("portfolio_risk", {}).get("risk_score", 0.0),
+            signals.get("portfolio_risk", {}).get("target_exposure", 0.0),
+            signals.get("portfolio_risk", {}).get("portfolio_volatility", 0.0),
+            signals.get("portfolio_risk", {}).get("average_correlation", 0.0),
+            signals.get("pre_risk_weights", {}),
+            signals["weights"],
         )
 
         if not signals["features"]:
             logger.info("Not enough history yet.")
             self.persist_runtime_state()
-            self.last_rebalance_ts = now
             return
 
+        # warm up
+        warmup_remaining_ms = (
+            self.cfg.startup_warmup_minutes * 60_000
+            - (now_ms() - self.session_start_ts)
+        )
+        if warmup_remaining_ms > 0:
+            logger.info(
+                "Startup warmup active, skip orders only. Remaining %.1f min",
+                warmup_remaining_ms / 60_000,
+            )
+            self.persist_runtime_state()
+            return
+
+        # freshness gate
+        fresh_ok, fresh_reason = self.history_is_fresh_enough()
+        if not fresh_ok:
+            logger.info("Freshness gate active, skip orders only. %s", fresh_reason)
+            self.persist_runtime_state()
+            return
+
+        # trade cooldown
+        cooldown_seconds = 300
+        if now - self.last_rebalance_ts < cooldown_seconds:
+            logger.info("Trading cooldown active, skip orders only.")
+            self.persist_runtime_state()
+            return
+
+        # 3. 真正下单
         self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
 
         portfolio = self.build_portfolio_snapshot(tickers)
@@ -864,6 +1037,7 @@ class RoostooMomentumBot:
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)
         self.add_target_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
+
         self.persist_runtime_state()
         self.last_rebalance_ts = now
 
