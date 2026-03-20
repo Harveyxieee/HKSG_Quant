@@ -116,13 +116,13 @@ def load_price_data(
 
     price_df = pd.concat(series_map, axis=1).sort_index()
     if frequency == "auto":
-        for label, rule in [("daily", "1D"), ("hourly", "1H"), ("raw", None)]:
+        for label, rule in [("daily", "1D"), ("hourly", "1h"), ("raw", None)]:
             candidate = _resample_price_frame(price_df, rule)
             if len(candidate) >= min_periods:
                 return candidate, label
         return _resample_price_frame(price_df, None), "raw"
 
-    mapping = {"daily": "1D", "hourly": "1H", "raw": None}
+    mapping = {"daily": "1D", "hourly": "1h", "raw": None}
     selected = _resample_price_frame(price_df, mapping.get(frequency, None))
     return selected, frequency if frequency in mapping else "raw"
 

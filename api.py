@@ -1,228 +1,181 @@
-import requests
-import time
-import hmac
+from __future__ import annotations
+
+import csv
 import hashlib
+import hmac
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-# --- API Configuration ---
-BASE_URL = "https://mock-api.roostoo.com"
-API_KEY = "YZJpIGyMhk1efgdP8qZM0LTZZ2eFJh35ovWByPgSG73XS5OeWruM8XygCqHypBK7"      # Replace with your actual API key
-SECRET_KEY = "PTtlKF7Vwed7MfiUCz6G6PySVDH5zP8Vjz4lmIYuxQyrjq5EvseYAJV3jAhVnYyK"  # Replace with your actual secret key
+import requests
 
-
-# ------------------------------
-# Utility Functions
-# ------------------------------
-
-def _get_timestamp():
-    """Return a 13-digit millisecond timestamp as string."""
-    return str(int(time.time() * 1000))
+logger = logging.getLogger(__name__)
 
 
-def _get_signed_headers(payload: dict = {}):
-    """
-    Generate signed headers and totalParams for RCL_TopLevelCheck endpoints.
-    """
-    payload['timestamp'] = _get_timestamp()
-    sorted_keys = sorted(payload.keys())
-    total_params = "&".join(f"{k}={payload[k]}" for k in sorted_keys)
-
-    signature = hmac.new(
-        SECRET_KEY.encode('utf-8'),
-        total_params.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-    headers = {
-        'RST-API-KEY': API_KEY,
-        'MSG-SIGNATURE': signature
-    }
-
-    return headers, payload, total_params
+class UnknownOrderStateError(RuntimeError):
+    pass
 
 
-# ------------------------------
-# Public Endpoints
-# ------------------------------
+class RoostooClient:
+    def __init__(self, cfg: Any):
+        self.cfg = cfg
+        self.time_offset_ms = 0
+        self.session = self._build_session()
 
-def check_server_time():
-    """Check API server time."""
-    url = f"{BASE_URL}/v3/serverTime"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error checking server time: {e}")
-        return None
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({"User-Agent": f"{self.cfg.bot_name}/1.0"})
+        return session
 
+    def reset_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._build_session()
 
-def get_exchange_info():
-    """Get exchange trading pairs and info."""
-    url = f"{BASE_URL}/v3/exchangeInfo"
-    try:
-        res = requests.get(url)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting exchange info: {e}")
-        return None
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
+    @staticmethod
+    def _append_csv(path: Path, headers: list[str], row: Dict[str, Any]) -> None:
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=headers)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
-def get_ticker(pair=None):
-    """Get ticker for one or all pairs."""
-    url = f"{BASE_URL}/v3/ticker"
-    params = {'timestamp': _get_timestamp()}
-    if pair:
-        params['pair'] = pair
-    try:
-        res = requests.get(url, params=params)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting ticker: {e}")
-        return None
+    @staticmethod
+    def _sha256_json(payload: Dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self.time_offset_ms
 
-# ------------------------------
-# Signed Endpoints
-# ------------------------------
+    def sync_time(self) -> int:
+        response = self.server_time()
+        server_time = int(float(response.get("ServerTime", int(time.time() * 1000))))
+        self.time_offset_ms = server_time - int(time.time() * 1000)
+        return server_time
 
-def get_balance():
-    """Get wallet balances (RCL_TopLevelCheck)."""
-    url = f"{BASE_URL}/v3/balance"
-    headers, payload, _ = _get_signed_headers({})
-    try:
-        res = requests.get(url, headers=headers, params=payload)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting balance: {e}")
-        print(f"Response text: {e.response.text if e.response else 'N/A'}")
-        return None
+    def _sign(self, params: Dict[str, Any]) -> str:
+        items = sorted((key, str(value)) for key, value in params.items())
+        payload = "&".join(f"{key}={value}" for key, value in items)
+        return hmac.new(self.cfg.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def get_pending_count():
-    """Get total pending order count."""
-    url = f"{BASE_URL}/v3/pending_count"
-    headers, payload, _ = _get_signed_headers({})
-    try:
-        res = requests.get(url, headers=headers, params=payload)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting pending count: {e}")
-        print(f"Response text: {e.response.text if e.response else 'N/A'}")
-        return None
+    def _log_request(self, method: str, path: str, params: Dict[str, Any], ok: bool, response_json: Any) -> None:
+        self._append_csv(
+            self.cfg.request_log_csv,
+            ["ts", "method", "path", "params_sha256", "ok", "response_snippet"],
+            {
+                "ts": int(time.time() * 1000),
+                "method": method,
+                "path": path,
+                "params_sha256": self._sha256_json(params),
+                "ok": ok,
+                "response_snippet": json.dumps(response_json, ensure_ascii=False)[:800],
+            },
+        )
 
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        signed: bool = False,
+        is_post: bool = False,
+        retry_safe: bool = True,
+        ambiguous_error_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        params = dict(params or {})
+        headers: Dict[str, str] = {}
+        if signed or path == "/v3/ticker":
+            params["timestamp"] = self.timestamp_ms()
+        if signed:
+            if not self.cfg.api_key or not self.cfg.api_secret:
+                raise RuntimeError("Signed endpoint requested but ROOSTOO_API_KEY / ROOSTOO_API_SECRET missing")
+            headers["RST-API-KEY"] = self.cfg.api_key
+            headers["MSG-SIGNATURE"] = self._sign(params)
+        if is_post:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-def place_order(pair_or_coin, side, quantity, price=None, order_type=None):
-    """
-    Place a LIMIT or MARKET order.
-    """
-    url = f"{BASE_URL}/v3/place_order"
-    pair = f"{pair_or_coin}/USD" if "/" not in pair_or_coin else pair_or_coin
+        url = f"{self.cfg.base_url}{path}"
+        last_exc: Optional[Exception] = None
+        max_attempts = self.cfg.max_retries if retry_safe else 1
+        for attempt in range(1, max_attempts + 1):
+            resp = None
+            try:
+                if is_post:
+                    resp = self.session.post(url, data=params, headers=headers, timeout=self.cfg.request_timeout)
+                else:
+                    resp = self.session.get(url, params=params, headers=headers, timeout=self.cfg.request_timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                self._log_request(method, path, params, True, data)
+                return data
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    snippet = resp.text[:800] if resp is not None else str(exc)
+                except Exception:
+                    snippet = str(exc)
+                self._log_request(method, path, params, False, {"error": snippet})
+                logger.warning("Request failed (%s %s) attempt %s/%s: %s", method, path, attempt, max_attempts, exc)
+                if "timestamp" in snippet.lower():
+                    try:
+                        self.sync_time()
+                    except Exception:
+                        pass
+                if retry_safe and attempt < max_attempts:
+                    self.reset_session()
+                    time.sleep(self.cfg.retry_sleep_seconds * (2 ** (attempt - 1)))
+        if ambiguous_error_message is not None:
+            raise UnknownOrderStateError(f"{ambiguous_error_message}: {last_exc}")
+        raise RuntimeError(f"Request failed after retries: {method} {path} -> {last_exc}")
 
-    if order_type is None:
-        order_type = "LIMIT" if price is not None else "MARKET"
+    def server_time(self) -> Dict[str, Any]:
+        return self._request("GET", "/v3/serverTime")
 
-    if order_type == 'LIMIT' and price is None:
-        print("Error: LIMIT orders require 'price'.")
-        return None
+    def exchange_info(self) -> Dict[str, Any]:
+        return self._request("GET", "/v3/exchangeInfo")
 
-    payload = {
-        'pair': pair,
-        'side': side.upper(),
-        'type': order_type.upper(),
-        'quantity': str(quantity)
-    }
-    if order_type == 'LIMIT':
-        payload['price'] = str(price)
+    def ticker(self, pair: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if pair:
+            params["pair"] = pair
+        return self._request("GET", "/v3/ticker", params=params)
 
-    headers, _, total_params = _get_signed_headers(payload)
-    headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    def balance(self) -> Dict[str, Any]:
+        return self._request("GET", "/v3/balance", signed=True)
 
-    try:
-        res = requests.post(url, headers=headers, data=total_params)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error placing order: {e}")
-        print(f"Response text: {e.response.text if e.response else 'N/A'}")
-        return None
+    def pending_count(self) -> Dict[str, Any]:
+        return self._request("GET", "/v3/pending_count", signed=True)
 
+    def place_market_order(self, pair: str, side: str, quantity: float) -> Dict[str, Any]:
+        payload = {"pair": pair, "side": side, "type": "MARKET", "quantity": quantity}
+        return self._request(
+            "POST",
+            "/v3/place_order",
+            params=payload,
+            signed=True,
+            is_post=True,
+            retry_safe=False,
+            ambiguous_error_message=f"Order submission status unknown for {side} {pair}",
+        )
 
-def query_order(order_id=None, pair=None, pending_only=None):
-    """Query order history or pending orders."""
-    url = f"{BASE_URL}/v3/query_order"
-    payload = {}
-    if order_id:
-        payload['order_id'] = str(order_id)
-    elif pair:
-        payload['pair'] = pair
-        if pending_only is not None:
-            payload['pending_only'] = 'TRUE' if pending_only else 'FALSE'
-
-    headers, _, total_params = _get_signed_headers(payload)
-    headers['Content-Type'] = 'application/x-www-form-urlencoded'
-
-    try:
-        res = requests.post(url, headers=headers, data=total_params)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error querying order: {e}")
-        print(f"Response text: {e.response.text if e.response else 'N/A'}")
-        return None
-
-
-def cancel_order(order_id=None, pair=None):
-    """Cancel specific or all pending orders."""
-    url = f"{BASE_URL}/v3/cancel_order"
-    payload = {}
-    if order_id:
-        payload['order_id'] = str(order_id)
-    elif pair:
-        payload['pair'] = pair
-
-    headers, _, total_params = _get_signed_headers(payload)
-    headers['Content-Type'] = 'application/x-www-form-urlencoded'
-
-    try:
-        res = requests.post(url, headers=headers, data=total_params)
-        res.raise_for_status()
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error canceling order: {e}")
-        print(f"Response text: {e.response.text if e.response else 'N/A'}")
-        return None
-
-
-# ------------------------------
-# Quick Demo Section
-# ------------------------------
-if __name__ == "__main__":
-    print("\n--- Checking Server Time ---")
-    print(check_server_time())
-
-    print("\n--- Getting Exchange Info ---")
-    info = get_exchange_info()
-    if info:
-        print(f"Available Pairs: {list(info.get('TradePairs', {}).keys())}")
-
-    print("\n--- Getting Market Ticker (BTC/USD) ---")
-    ticker = get_ticker("BTC/USD")
-    if ticker:
-        print(ticker.get("Data", {}).get("BTC/USD", {}))
-
-    print("\n--- Getting Account Balance ---")
-    print(get_balance())
-
-    print("\n--- Checking Pending Orders ---")
-    print(get_pending_count())
-
-    # Uncomment these to test trading actions:
-    print(place_order("BTC", "BUY", 0.01, price=95000))  # LIMIT
-    print(place_order("BNB/USD", "BUY", 1))
-    print(place_order("BNB/USD", "SELL", 1))             # MARKET
-    print(query_order(pair="BNB/USD", pending_only=False))
-    print(cancel_order(pair="BNB/USD"))
+    def cancel_order(self, pair: Optional[str] = None, order_id: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if pair:
+            payload["pair"] = pair
+        if order_id:
+            payload["order_id"] = order_id
+        return self._request("POST", "/v3/cancel_order", params=payload, signed=True, is_post=True)
 
