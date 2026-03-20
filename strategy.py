@@ -11,6 +11,7 @@ from collections import deque
 import numpy as np
 import pandas as pd
 
+
 FeatureMap = Dict[str, Dict[str, float]]
 
 
@@ -508,9 +509,13 @@ class MomentumStrategy:
         self.regime_filter: Optional[RegimeFilter] = None
         self.mu_weight = float(os.getenv("MU_BLEND_WEIGHT", "0.15"))
         self.fixed_weight = float(os.getenv("FIXED_BLEND_WEIGHT", str(1.0 - self.mu_weight)))
-        model_path = os.getenv("MU_MODEL_PATH", "")
-        meta_path = os.getenv("MU_MODEL_META_PATH", "")
-        self.mu_model = MuModelWrapper(model_path, meta_path)
+        repo_root = Path(__file__).resolve().parent
+        default_model_path = repo_root / "artifacts" / "mu_xgb_model.json"
+        default_meta_path = repo_root / "artifacts" / "mu_xgb_model.meta.json"
+
+        self.mu_model_path = os.getenv("MU_MODEL_PATH", str(default_model_path))
+        self.mu_model_meta_path = os.getenv("MU_MODEL_META_PATH", str(default_meta_path))
+        self.mu_model = MuModelWrapper(self.mu_model_path, self.mu_model_meta_path)
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:

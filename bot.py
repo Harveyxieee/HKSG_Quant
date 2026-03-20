@@ -982,17 +982,34 @@ class RoostooMomentumBot:
         self.log_signal_snapshot(signals)
 
         logger.info(
-            "Regime=%s overlay_regime=%s overlay_score=%.2f target_exposure=%.2f "
-            "port_vol=%.4f avg_corr=%.4f pre=%s final=%s",
+            "Regime=%s overlay_regime=%s overlay_score=%.2f "
+            "target_exposure=%.2f port_vol=%.4f avg_corr=%.4f "
+            "mu_ready=%s mu_error=%s mu_blend=%.2f fixed_blend=%.2f "
+            "pre=%s final=%s",
             signals["regime"]["regime"],
-            signals.get("portfolio_risk", {}).get("market_regime", "unknown"),
-            signals.get("portfolio_risk", {}).get("risk_score", 0.0),
-            signals.get("portfolio_risk", {}).get("target_exposure", 0.0),
-            signals.get("portfolio_risk", {}).get("portfolio_volatility", 0.0),
-            signals.get("portfolio_risk", {}).get("average_correlation", 0.0),
+            signals["portfolio_risk"]["market_regime"],
+            signals["portfolio_risk"]["risk_score"],
+            signals["portfolio_risk"]["target_exposure"],
+            signals["portfolio_risk"]["portfolio_volatility"],
+            signals["portfolio_risk"]["average_correlation"],
+            signals["regime"].get("mu_ready"),
+            signals["regime"].get("mu_error"),
+            signals["regime"].get("mu_blend_weight"),
+            signals["regime"].get("fixed_blend_weight"),
             signals.get("pre_risk_weights", {}),
-            signals["weights"],
+            signals.get("weights", {}),
         )
+
+        sample_pairs = list(signals.get("features", {}).items())[:5]
+        sample_mu = {
+            pair: {
+                "pred_mu": feat.get("pred_mu"),
+                "pred_mu_z": feat.get("pred_mu_z"),
+                "score": feat.get("score"),
+            }
+            for pair, feat in sample_pairs
+        }
+        logger.info("MU sample=%s", sample_mu)
 
         if not signals["features"]:
             logger.info("Not enough history yet.")
