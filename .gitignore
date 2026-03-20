@@ -213,5 +213,6 @@ data/
 logs/
 
 *.json
-!models/
-!models/*.json
+!artifacts/
+!artifacts/*.json
+!artifacts/mu_test_predictions
