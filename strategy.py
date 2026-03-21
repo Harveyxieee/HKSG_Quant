@@ -1,12 +1,18 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import json
 import math
-from collections import deque
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from collections import deque
 import numpy as np
 import pandas as pd
+import logging
+logger = logging.getLogger(__name__)
+
 
 FeatureMap = Dict[str, Dict[str, float]]
 
@@ -61,21 +67,21 @@ class MarketSnapshot:
     positive_score_ratio: float = 0.0
     avg_score: float = 0.0
 
-
 @dataclass
 class PortfolioRiskState:
     covariance_matrix: Dict[str, Dict[str, float]] = field(default_factory=dict)
     portfolio_volatility: float = 0.0
     average_correlation: float = 0.0
     market_regime: str = "neutral"
-    risk_score: float = 0.5
+    risk_score: float = 0.0
     target_exposure: float = 0.0
     diversification_breakdown: bool = False
-    data_frequency: str = "raw"
+    data_frequency: str = "1m"
     raw_weights: Dict[str, float] = field(default_factory=dict)
     adjusted_weights: Dict[str, float] = field(default_factory=dict)
-
-
+# =========================
+# REGIME FILTER
+# =========================
 def _resample_price_frame(price_df: pd.DataFrame, rule: Optional[str]) -> pd.DataFrame:
     if price_df.empty:
         return pd.DataFrame()
@@ -83,7 +89,6 @@ def _resample_price_frame(price_df: pd.DataFrame, rule: Optional[str]) -> pd.Dat
     candidate = candidate.sort_index().ffill().dropna(how="all")
     candidate = candidate.loc[:, candidate.notna().sum() >= 2]
     return candidate
-
 
 def load_price_data(
     history: Dict[str, Deque[Dict[str, float]]],
@@ -116,13 +121,13 @@ def load_price_data(
 
     price_df = pd.concat(series_map, axis=1).sort_index()
     if frequency == "auto":
-        for label, rule in [("daily", "1D"), ("hourly", "1h"), ("raw", None)]:
+        for label, rule in [("daily", "1D"), ("hourly", "1H"), ("raw", None)]:
             candidate = _resample_price_frame(price_df, rule)
             if len(candidate) >= min_periods:
                 return candidate, label
         return _resample_price_frame(price_df, None), "raw"
 
-    mapping = {"daily": "1D", "hourly": "1h", "raw": None}
+    mapping = {"daily": "1D", "hourly": "1H", "raw": None}
     selected = _resample_price_frame(price_df, mapping.get(frequency, None))
     return selected, frequency if frequency in mapping else "raw"
 
@@ -139,15 +144,33 @@ def compute_returns(price_df: pd.DataFrame, method: str = "pct_change") -> pd.Da
     return returns_df
 
 
-def compute_cov_matrix(returns_df: pd.DataFrame, window: int) -> pd.DataFrame:
+def compute_cov_matrix(
+    returns_df: pd.DataFrame,
+    min_samples_per_asset: int = 30,
+    min_periods_pairwise: int = 20,
+    shrinkage: float = 0.25,
+) -> pd.DataFrame:
     if returns_df.empty:
         return pd.DataFrame()
-    sample = returns_df.tail(window).dropna(how="all")
-    sample = sample.loc[:, sample.notna().sum() >= 2]
-    sample = sample.dropna(axis=0, how="any")
-    if len(sample) < 2 or sample.empty:
+
+    valid_counts = returns_df.notna().sum(axis=0)
+    keep_cols = valid_counts[valid_counts >= min_samples_per_asset].index.tolist()
+    returns_df = returns_df[keep_cols]
+
+    if returns_df.shape[1] == 0:
         return pd.DataFrame()
-    return sample.cov()
+
+    cov = returns_df.cov(min_periods=min_periods_pairwise)
+    for col in cov.columns:
+        if pd.isna(cov.loc[col, col]):
+            asset_var = returns_df[col].var()
+            cov.loc[col, col] = asset_var if pd.notna(asset_var) else 0.0
+
+    cov = cov.fillna(0.0)
+    cov_values = cov.to_numpy(dtype=float)
+    diag_values = np.diag(np.diag(cov_values))
+    shrunk = (1.0 - shrinkage) * cov_values + shrinkage * diag_values
+    return pd.DataFrame(shrunk, index=cov.index, columns=cov.columns)
 
 
 def compute_portfolio_volatility(weights: Dict[str, float], cov_matrix: pd.DataFrame) -> float:
@@ -166,29 +189,52 @@ def compute_average_correlation(
     returns_df: Optional[pd.DataFrame] = None,
     cov_matrix: Optional[pd.DataFrame] = None,
     window: int = 60,
+    min_samples_per_asset: int = 30,
+    min_periods_pairwise: int = 20,
 ) -> float:
     if returns_df is not None and not returns_df.empty:
         sample = returns_df.tail(window).dropna(how="all")
-        sample = sample.loc[:, sample.notna().sum() >= 2]
-        sample = sample.dropna(axis=0, how="any")
-        if sample.shape[1] < 2 or len(sample) < 2:
+        if sample.empty:
             return 0.0
-        corr_matrix = sample.corr()
+
+        valid_counts = sample.notna().sum(axis=0)
+        keep_cols = valid_counts[valid_counts >= min_samples_per_asset].index.tolist()
+        sample = sample[keep_cols]
+
+        if sample.shape[1] < 2:
+            return 0.0
+
+        corr_matrix = sample.corr(min_periods=min_periods_pairwise)
+
     elif cov_matrix is not None and not cov_matrix.empty:
         diag = np.sqrt(np.maximum(np.diag(cov_matrix.to_numpy(dtype=float)), 0.0))
         denom = np.outer(diag, diag)
         with np.errstate(divide="ignore", invalid="ignore"):
-            corr_values = np.divide(cov_matrix.to_numpy(dtype=float), denom, where=denom > 0)
-        corr_matrix = pd.DataFrame(corr_values, index=cov_matrix.index, columns=cov_matrix.columns)
+            corr_values = np.divide(
+                cov_matrix.to_numpy(dtype=float),
+                denom,
+                where=denom > 0,
+            )
+        corr_matrix = pd.DataFrame(
+            corr_values,
+            index=cov_matrix.index,
+            columns=cov_matrix.columns,
+        )
     else:
         return 0.0
 
     if corr_matrix.shape[0] < 2:
         return 0.0
-    mask = ~np.eye(corr_matrix.shape[0], dtype=bool)
-    values = corr_matrix.to_numpy(dtype=float)[mask]
-    finite = values[np.isfinite(values)]
-    return float(finite.mean()) if finite.size else 0.0
+
+    values = []
+    cols = corr_matrix.columns.tolist()
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            v = corr_matrix.iloc[i, j]
+            if pd.notna(v) and np.isfinite(v):
+                values.append(float(v))
+
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 def check_diversification_breakdown(average_correlation: float, threshold: float) -> bool:
@@ -289,12 +335,18 @@ def adjust_weights_by_risk(
         asset_volatility = {pair: float(diag[idx]) for idx, pair in enumerate(common)}
         corr_sample = returns_df.tail(cfg.risk_cov_window).dropna(how="all")
         corr_sample = corr_sample.loc[:, [pair for pair in common if pair in corr_sample.columns]]
-        corr_sample = corr_sample.dropna(axis=0, how="any")
-        if corr_sample.shape[1] >= 2 and len(corr_sample) >= 2:
-            corr_matrix = corr_sample.corr()
-            for pair in corr_matrix.columns:
-                others = corr_matrix.loc[pair, corr_matrix.columns != pair]
-                asset_correlation[pair] = float(others.mean()) if len(others) else 0.0
+
+        if not corr_sample.empty and corr_sample.shape[1] >= 2:
+            valid_counts = corr_sample.notna().sum(axis=0)
+            keep_cols = valid_counts[valid_counts >= max(10, cfg.risk_cov_window // 3)].index.tolist()
+            corr_sample = corr_sample[keep_cols]
+
+            if corr_sample.shape[1] >= 2:
+                corr_matrix = corr_sample.corr(min_periods=max(8, cfg.risk_cov_window // 4))
+                for pair in corr_matrix.columns:
+                    others = corr_matrix.loc[pair, corr_matrix.columns != pair]
+                    others = others[np.isfinite(others)]
+                    asset_correlation[pair] = float(others.mean()) if len(others) else 0.0
 
     positive_vols = [value for value in asset_volatility.values() if value > 0]
     median_volatility = median(positive_vols) if positive_vols else 0.0
@@ -338,43 +390,65 @@ def adjust_weights_by_risk(
 
 
 class RegimeFilter:
-    def __init__(self, symbols, btc_symbol="BTC/USD", maxlen=200):
-        self.symbols = symbols
+    def __init__(self, symbols: List[str], btc_symbol: str = "BTC/USD", maxlen: int = 200):
+        self.symbols = list(symbols)
         self.btc_symbol = btc_symbol
+        self.maxlen = maxlen
         self.price_history = {s: deque(maxlen=maxlen) for s in symbols}
         self.current_regime = None
 
-    def update_market_data(self, tickers):
+    def sync_symbols(self, symbols: List[str]) -> None:
+        """
+        universe 鍙樺寲鏃朵繚鐣欏凡鏈?symbol 鐨勫巻鍙诧紝鍙鍒犳槧灏勶紝涓嶆暣瀵硅薄閲嶅缓銆?        """
+        new_symbols = list(symbols)
+        new_set = set(new_symbols)
+        old_set = set(self.price_history.keys())
+
+        # 鏂板 symbol锛氬垱寤烘柊 deque
+        for symbol in new_symbols:
+            if symbol not in self.price_history:
+                self.price_history[symbol] = deque(maxlen=self.maxlen)
+
+        # 鍒犻櫎涓嶅啀闇€瑕佺殑 symbol
+        for symbol in list(old_set - new_set):
+            self.price_history.pop(symbol, None)
+
+        # 淇濇寔杩唬椤哄簭涓庡綋鍓?universe 涓€鑷?        self.symbols = new_symbols
+        self.price_history = {symbol: self.price_history[symbol] for symbol in self.symbols}
+
+    def update_market_data(self, tickers: Dict[str, Dict[str, float]]) -> None:
         for symbol in self.symbols:
             if symbol in tickers:
                 price = tickers[symbol].get("LastPrice", 0)
                 if price > 0:
                     self.price_history[symbol].append(float(price))
 
-    def _to_df(self):
-        df = pd.DataFrame({k: list(v) for k, v in self.price_history.items()})
+    def _to_df(self) -> pd.DataFrame:
+        non_empty = {
+            k: list(v)
+            for k, v in self.price_history.items()
+            if len(v) > 0
+        }
+        if not non_empty:
+            return pd.DataFrame()
+        df = pd.DataFrame(non_empty)
         return df.ffill().dropna(how="all")
 
-    def detect_regime(self):
+    def detect_regime(self) -> Dict[str, float]:
         price_df = self._to_df()
 
         if self.btc_symbol not in price_df or len(price_df[self.btc_symbol]) < 10:
-            self.current_regime = {
-                "regime": "neutral",
-                "risk_multiplier": 0.5,
-            }
+            self.current_regime = {"regime": "neutral", "risk_multiplier": 0.5}
             return self.current_regime
-        returns_df = price_df.pct_change()
 
+        returns_df = price_df.pct_change(fill_method=None)
         btc_price = price_df[self.btc_symbol]
         ma = btc_price.rolling(min(50, len(btc_price))).mean()
         if len(btc_price) < 10 or np.isnan(ma.iloc[-1]):
-            self.current_regime = {
-                "regime": "neutral",
-                "risk_multiplier": 0.5,
-            }
+            self.current_regime = {"regime": "neutral", "risk_multiplier": 0.5}
             return self.current_regime
-        btc_trend = btc_price.iloc[-1] / ma.iloc[-1] - 1
+
+        btc_trend = btc_price.iloc[-1] / ma.iloc[-1] - 1.0
 
         btc_returns = returns_df[self.btc_symbol]
         vol = btc_returns.rolling(min(20, len(btc_returns))).std()
@@ -383,12 +457,12 @@ class RegimeFilter:
             vol_pct = 0.5
         else:
             current = vol.iloc[-1]
-            vol_pct = (vol_window < current).mean()
+            vol_pct = float((vol_window < current).mean())
 
         latest_returns = returns_df.iloc[-1].dropna()
         if len(latest_returns) == 0:
             return self.current_regime or {"regime": "neutral", "risk_multiplier": 0.5}
-        breadth = (latest_returns > 0).mean()
+        breadth = float((latest_returns > 0).mean())
 
         score = 0
         if btc_trend > 0.01:
@@ -404,10 +478,8 @@ class RegimeFilter:
             score += 1
         if breadth < 0.3:
             score -= 1
-
-        if latest_returns.mean() > 0:
+        if float(latest_returns.mean()) > 0:
             score += 1
-
         if vol_pct > 0.95:
             score -= 2
         elif vol_pct > 0.8:
@@ -428,27 +500,137 @@ class RegimeFilter:
             else:
                 regime = "neutral"
 
-        mapping = {
-            "trend": 1.0,
-            "neutral": 0.6,
-            "range": 0.5,
-            "panic": 0.2,
-        }
-        self.current_regime = {
-            "regime": regime,
-            "risk_multiplier": mapping[regime],
-        }
+        mapping = {"trend": 1.0, "neutral": 0.6, "range": 0.5, "panic": 0.2}
+        self.current_regime = {"regime": regime, "risk_multiplier": mapping[regime]}
         return self.current_regime
+
+
+class MuModelWrapper:
+    def __init__(
+        self,
+        model_path: Optional[str],
+        meta_path: Optional[str],
+        required: bool = False,
+    ):
+        self.model = None
+        self.feature_names: List[str] = []
+        self.feature_defaults: Dict[str, float] = {}
+        self.ready = False
+        self.error: Optional[str] = None
+        self.model_path = model_path
+        self.meta_path = meta_path
+        self.required = required
+        self._load()
+
+    def _load(self) -> None:
+        if not self.model_path or not self.meta_path:
+            self.error = "MU_MODEL_PATH or MU_MODEL_META_PATH missing"
+            if self.required:
+                raise RuntimeError(self.error)
+            return
+
+        if not Path(self.model_path).exists() or not Path(self.meta_path).exists():
+            self.error = (
+                f"mu model or metadata file not found: "
+                f"model_path={self.model_path}, meta_path={self.meta_path}"
+            )
+            if self.required:
+                raise RuntimeError(self.error)
+            return
+
+        try:
+            from xgboost import XGBRegressor
+
+            model = XGBRegressor()
+            model.load_model(self.model_path)
+
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            feature_names = meta.get("feature_names")
+            if not feature_names:
+                feature_names = meta.get("feature_columns", [])
+
+            self.feature_names = list(feature_names)
+
+            feature_defaults = meta.get("feature_defaults")
+            if not feature_defaults:
+                feature_defaults = {name: 0.0 for name in self.feature_names}
+
+            self.feature_defaults = dict(feature_defaults)
+
+            if not self.feature_names:
+                raise ValueError("feature_names/feature_columns missing in metadata")
+
+            self.model = model
+            self.ready = True
+            self.error = None
+
+        except Exception as exc:
+            self.error = f"failed to load MU model: {exc}"
+            self.ready = False
+            if self.required:
+                raise RuntimeError(self.error) from exc
+
+    def predict(self, rows: List[Dict[str, float]]) -> List[float]:
+        if not self.ready or self.model is None:
+            if self.required:
+                raise RuntimeError(
+                    f"MU model unavailable during predict: {self.error or 'unknown error'}"
+                )
+            return [0.0 for _ in rows]
+
+        import pandas as pd
+
+        frame_rows = []
+        for row in rows:
+            data = {
+                name: row.get(name, self.feature_defaults.get(name, 0.0))
+                for name in self.feature_names
+            }
+            frame_rows.append(data)
+
+        X = pd.DataFrame(frame_rows, columns=self.feature_names)
+        preds = self.model.predict(X)
+        return [float(x) for x in preds]
 
 
 class MomentumStrategy:
     def __init__(self, cfg: Any):
         self.cfg = cfg
-        self.regime_filter = None
+        self.regime_filter: Optional[RegimeFilter] = None
+        self.mu_weight = float(os.getenv("MU_BLEND_WEIGHT", "0.15"))
+        self.fixed_weight = float(os.getenv("FIXED_BLEND_WEIGHT", str(1.0 - self.mu_weight)))
+        repo_root = Path(__file__).resolve().parent
+        default_model_path = repo_root / "artifacts" / "mu_xgb_model.json"
+        default_meta_path = repo_root / "artifacts" / "mu_xgb_model.meta.json"
+
+        self.mu_model_path = os.getenv("MU_MODEL_PATH", str(default_model_path))
+        self.mu_model_meta_path = os.getenv("MU_MODEL_META_PATH", str(default_meta_path))
+
+        self.mu_model_required = (
+                os.getenv("MU_MODEL_REQUIRED", "true").strip().lower() == "true"
+        )
+
+        logger.info("MU model path=%s", self.mu_model_path)
+        logger.info("MU meta path=%s", self.mu_model_meta_path)
+        logger.info("MU model required=%s", self.mu_model_required)
+
+        self.mu_model = MuModelWrapper(
+            self.mu_model_path,
+            self.mu_model_meta_path,
+            required=self.mu_model_required,
+        )
+
+        # --- turnover reduction / less aggressive sell ---
         self.rank_retention_buffer = 0.18
+        self.holding_bonus_floor = 0.22
+
+        # anti-chase for new entries
         self.pump_chase_cutoff = 0.035
         self.pullback_entry_floor = -0.025
-        self.holding_bonus_floor = 0.22
+        self.range_keep_exposure = 0.30
+        self.risk_exposure_haircut = 0.60
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -485,27 +667,7 @@ class MomentumStrategy:
                 pending.pop(pair, None)
         return {pair: weight for pair, weight in weights.items() if weight > 0}
 
-    def exposure_multiplier(self, regime_name: str, snapshot: MarketSnapshot) -> float:
-        multiplier = {
-            "trend": 0.90,
-            "neutral": 0.45,
-            "range": 0.0,
-            "panic": 0.0,
-        }.get(regime_name, 0.35)
-
-        breadth = snapshot.positive_score_ratio
-        if breadth >= 0.60:
-            multiplier *= 1.0
-        elif breadth >= 0.50:
-            multiplier *= 0.85
-        else:
-            multiplier *= 0.65
-
-        if snapshot.median_ret60 <= 0:
-            multiplier *= 0.75
-        return clamp(multiplier, 0.0, 1.0)
-
-    def compute_features(
+    def _base_feature_block(
         self,
         history: Dict[str, Deque[Dict[str, float]]],
         trade_pairs: Dict[str, Dict[str, Any]],
@@ -516,23 +678,22 @@ class MomentumStrategy:
             if pair not in trade_pairs or len(series) < self.cfg.min_history:
                 continue
             prices = [entry["price"] for entry in series]
-            if len(prices) < 2:
-                continue
             price = prices[-1]
-            returns_1m = []
+            returns_1m: List[float] = []
             max_lookback = min(60, len(prices) - 1)
-
             for offset in range(1, max_lookback + 1):
                 current = prices[-offset]
                 previous = prices[-offset - 1]
                 if previous > 0:
                     returns_1m.append(current / previous - 1.0)
-
             if len(prices) < 20:
                 continue
+
             ma20 = mean(prices[-20:])
+            ma60 = mean(prices[-60:]) if len(prices) >= 60 else mean(prices)
             high20 = max(prices[-20:])
             low20 = min(prices[-20:])
+            vol20 = stddev(returns_1m[:20]) if len(returns_1m) >= 20 else stddev(returns_1m)
             vol60 = stddev(returns_1m)
             bid = series[-1]["bid"]
             ask = series[-1]["ask"]
@@ -541,40 +702,84 @@ class MomentumStrategy:
                 mid = (bid + ask) / 2.0
                 if mid > 0:
                     spread = (ask - bid) / mid
-            features[pair] = {
+            volume_values = [float(entry.get("unit_trade_value", 0.0)) for entry in list(series)[-20:]]
+            current_volume = float(series[-1].get("unit_trade_value", 0.0))
+            volume_z20 = zscore(current_volume, volume_values) if len(volume_values) >= 2 else 0.0
+
+            quote_volume_values = [float(entry.get("quote_volume", entry.get("unit_trade_value", 0.0))) for entry in
+                                   list(series)[-20:]]
+            current_quote_volume = float(series[-1].get("quote_volume", series[-1].get("unit_trade_value", 0.0)))
+            quote_volume_z20 = zscore(current_quote_volume, quote_volume_values) if len(
+                quote_volume_values) >= 2 else 0.0
+
+            # 褰撳墠 Roostoo history 閲屾病鏈夌嫭绔?quote_volume / trades 瀛楁锛?            # 鏆傛椂鐢?unit_trade_value 浠ｇ悊 quote_volume锛宼rades 鍏堣涓?0
+            quote_volume_z20 = volume_z20
+            trades_z20 = 0.0
+
+            feature = {
                 "price": price,
-                "ret5": compute_return(prices, 5),
-                "ret15": compute_return(prices, 15),
-                "ret30": compute_return(prices, 30),
-                "ret60": compute_return(prices, 60),
+                "ret1": compute_return(prices, 1) if len(prices) > 1 else 0.0,
+                "ret3": compute_return(prices, 3) if len(prices) > 3 else 0.0,
+                "ret5": compute_return(prices, 5) if len(prices) > 5 else 0.0,
+                "ret15": compute_return(prices, 15) if len(prices) > 15 else 0.0,
+                "ret30": compute_return(prices, 30) if len(prices) > 30 else 0.0,
+                "ret60": compute_return(prices, 60) if len(prices) > 60 else 0.0,
                 "dist_ma20": price / ma20 - 1.0 if ma20 > 0 else 0.0,
+                "dist_ma60": price / ma60 - 1.0 if ma60 > 0 else 0.0,
+                "vol20": vol20,
                 "vol60": vol60,
-                "trend_ratio60": compute_return(prices, 60) / max(vol60 * math.sqrt(max(len(returns_1m), 1)), 1e-9),
-                "efficiency20": self.trend_efficiency(prices, 20),
+                "trend_ratio60": compute_return(prices, 60) / max(vol60 * math.sqrt(max(len(returns_1m), 1)),
+                                                                  1e-9) if len(prices) > 60 else 0.0,
+                "efficiency20": self.trend_efficiency(prices, 20) if len(prices) >= 3 else 0.0,
                 "range_position20": 0.5 if high20 <= low20 else clamp((price - low20) / (high20 - low20), 0.0, 1.0),
                 "pullback20": price / high20 - 1.0 if high20 > 0 else 0.0,
                 "spread": spread,
-                "change_24h": series[-1]["change_24h"],
-                "unit_trade_value": series[-1]["unit_trade_value"],
+                "change_24h": float(series[-1].get("change_24h", 0.0)),
+                "unit_trade_value": current_volume,
+                "quote_volume": current_quote_volume,
+                "volume_z20": volume_z20,
+                "quote_volume_z20": quote_volume_z20,
             }
-            if spread <= self.cfg.spread_threshold and series[-1]["unit_trade_value"] >= self.cfg.min_24h_dollar_vol:
+            features[pair] = feature
+            if spread <= self.cfg.spread_threshold and current_volume >= self.cfg.min_24h_dollar_vol:
                 eligible_pairs.append(pair)
-        if not eligible_pairs:
+        return {pair: features[pair] for pair in eligible_pairs}
+
+    def compute_features(
+        self,
+        history: Dict[str, Deque[Dict[str, float]]],
+        trade_pairs: Dict[str, Dict[str, Any]],
+    ) -> FeatureMap:
+        features = self._base_feature_block(history, trade_pairs)
+        if not features:
             return {}
 
-        ret5_values = [features[pair]["ret5"] for pair in eligible_pairs]
-        ret15_values = [features[pair]["ret15"] for pair in eligible_pairs]
-        ret30_values = [features[pair]["ret30"] for pair in eligible_pairs]
-        ret60_values = [features[pair]["ret60"] for pair in eligible_pairs]
-        dist_values = [features[pair]["dist_ma20"] for pair in eligible_pairs]
-        vol_values = [features[pair]["vol60"] for pair in eligible_pairs]
-        trend_values = [features[pair]["trend_ratio60"] for pair in eligible_pairs]
-        efficiency_values = [features[pair]["efficiency20"] for pair in eligible_pairs]
-        range_values = [features[pair]["range_position20"] for pair in eligible_pairs]
+        pairs = list(features.keys())
+        ret1_values = [features[p]["ret1"] for p in pairs]
+        ret3_values = [features[p]["ret3"] for p in pairs]
+        ret5_values = [features[p]["ret5"] for p in pairs]
+        ret15_values = [features[p]["ret15"] for p in pairs]
+        ret30_values = [features[p]["ret30"] for p in pairs]
+        ret60_values = [features[p]["ret60"] for p in pairs]
+        dist20_values = [features[p]["dist_ma20"] for p in pairs]
+        dist60_values = [features[p]["dist_ma60"] for p in pairs]
+        vol20_values = [features[p]["vol20"] for p in pairs]
+        vol60_values = [features[p]["vol60"] for p in pairs]
+        trend_values = [features[p]["trend_ratio60"] for p in pairs]
+        efficiency_values = [features[p]["efficiency20"] for p in pairs]
+        range_values = [features[p]["range_position20"] for p in pairs]
+        pullback_values = [features[p]["pullback20"] for p in pairs]
+        volumez_values = [features[p]["volume_z20"] for p in pairs]
+        quote_volumez_values = [features[p]["quote_volume_z20"] for p in pairs]
 
-        for pair in eligible_pairs:
+        inference_rows: List[Dict[str, float]] = []
+        inference_pairs: List[str] = []
+
+        for pair in pairs:
             feature = features[pair]
-            score = (
+
+            # fixed score (original prior-driven engine)
+            fixed_score = (
                 0.18 * zscore(feature["ret5"], ret5_values)
                 + 0.22 * zscore(feature["ret15"], ret15_values)
                 + 0.20 * zscore(feature["ret30"], ret30_values)
@@ -582,23 +787,65 @@ class MomentumStrategy:
                 + 0.10 * zscore(feature["trend_ratio60"], trend_values)
                 + 0.08 * zscore(feature["efficiency20"], efficiency_values)
                 + 0.06 * zscore(feature["range_position20"], range_values)
-                + 0.10 * zscore(-feature["dist_ma20"], [-value for value in dist_values])
-                + 0.12 * (-zscore(feature["vol60"], vol_values))
+                + 0.10 * zscore(-feature["dist_ma20"], [-v for v in dist20_values])
+                + 0.12 * (-zscore(feature["vol60"], vol60_values))
             )
             if feature["dist_ma20"] > self.cfg.max_pump_distance:
-                score -= 0.20 + 2.5 * (feature["dist_ma20"] - self.cfg.max_pump_distance)
-            if feature["ret5"] > 0.05 and feature["dist_ma20"] > self.pump_chase_cutoff:
-                score -= 0.18 + 1.8 * (feature["dist_ma20"] - self.pump_chase_cutoff)
+                fixed_score -= 0.20 + 2.5 * (feature["dist_ma20"] - self.cfg.max_pump_distance)
             if feature["spread"] > self.cfg.spread_threshold * 0.7:
-                score -= 0.15 * (feature["spread"] / max(self.cfg.spread_threshold, 1e-9))
+                fixed_score -= 0.15 * (feature["spread"] / max(self.cfg.spread_threshold, 1e-9))
             if feature["ret5"] < 0 and feature["pullback20"] < -0.03:
-                score -= 0.12
+                fixed_score -= 0.12
             if feature["ret60"] < 0 and feature["ret5"] > 0.02:
-                score -= 0.10
-            if feature["range_position20"] > 0.92 and feature["ret15"] > 0.03:
-                score -= 0.08
-            feature["score"] = score
-        return {pair: features[pair] for pair in eligible_pairs}
+                fixed_score -= 0.10
+            feature["fixed_score"] = fixed_score
+
+            # relative features for universal mu inference
+            row = {
+                "ret_1": feature["ret1"],
+                "ret_3": feature["ret3"],
+                "ret_5": feature["ret5"],
+                "ret_15": feature["ret15"],
+                "ret_30": feature["ret30"],
+                "ret_60": feature["ret60"],
+                "dist_ma20": feature["dist_ma20"],
+                "dist_ma60": feature["dist_ma60"],
+                "vol20": feature["vol20"],
+                "vol60": feature["vol60"],
+                "range_pos20": feature["range_position20"],
+                "pullback20": feature["pullback20"],
+                "volume_z20": feature["volume_z20"],
+                "quote_volume_z20": feature["quote_volume_z20"],
+                "hour": 0.0,
+                "day": 0.0,
+
+                "ret_1_cs_z": zscore(feature["ret1"], ret1_values),
+                "ret_3_cs_z": zscore(feature["ret3"], ret3_values),
+                "ret_5_cs_z": zscore(feature["ret5"], ret5_values),
+                "ret_15_cs_z": zscore(feature["ret15"], ret15_values),
+                "ret_30_cs_z": zscore(feature["ret30"], ret30_values),
+                "ret_60_cs_z": zscore(feature["ret60"], ret60_values),
+                "dist_ma20_cs_z": zscore(feature["dist_ma20"], dist20_values),
+                "dist_ma60_cs_z": zscore(feature["dist_ma60"], dist60_values),
+                "vol20_cs_z": zscore(feature["vol20"], vol20_values),
+                "vol60_cs_z": zscore(feature["vol60"], vol60_values),
+                "range_pos20_cs_z": zscore(feature["range_position20"], range_values),
+                "pullback20_cs_z": zscore(feature["pullback20"], pullback_values),
+                "volume_z20_cs_z": zscore(feature["volume_z20"], volumez_values),
+                "quote_volume_z20_cs_z": zscore(feature["quote_volume_z20"], quote_volumez_values),
+            }
+            inference_pairs.append(pair)
+            inference_rows.append(row)
+
+        preds = self.mu_model.predict(inference_rows)
+        mu_values = preds if preds else [0.0 for _ in inference_rows]
+        mu_z_values = [zscore(v, mu_values) for v in mu_values] if len(mu_values) >= 2 else [0.0 for _ in mu_values]
+
+        for i, pair in enumerate(inference_pairs):
+            features[pair]["pred_mu"] = mu_values[i]
+            features[pair]["pred_mu_z"] = mu_z_values[i]
+            features[pair]["score"] = self.fixed_weight * features[pair]["fixed_score"] + self.mu_weight * features[pair]["pred_mu_z"]
+        return features
 
     def market_snapshot(self, features: FeatureMap) -> MarketSnapshot:
         if not features:
@@ -627,57 +874,128 @@ class MomentumStrategy:
             and snapshot.positive_score_ratio >= self.cfg.market_positive_score_ratio_threshold
         )
 
-    def target_weights(
+    def _select_ranked_with_retention(
         self,
-        features: FeatureMap,
-        risk_on: bool,
-        positions: Dict[str, float],
+        ranked: List[Tuple[str, Dict[str, float], float, float]],
+        held_pairs: set[str],
+    ) -> List[Tuple[str, Dict[str, float], float, float]]:
+        if not ranked:
+            return []
+
+        ranked.sort(
+            key=lambda item: (
+                item[2],
+                item[1].get("pred_mu", 0.0),
+                item[1]["trend_ratio60"],
+                item[1]["ret15"],
+            ),
+            reverse=True,
+        )
+
+        if len(ranked) <= self.cfg.top_n:
+            return ranked
+
+        selected = ranked[: self.cfg.top_n]
+        selected_pairs = {item[0] for item in selected}
+        cutoff_score = selected[-1][2]
+
+        for item in ranked[self.cfg.top_n:]:
+            pair, feature, ranking_score, threshold = item
+            if pair not in held_pairs:
+                continue
+            if pair in selected_pairs:
+                continue
+
+            # 宸叉湁鎸佷粨鍙娌℃槑鏄炬帀鍑?cutoff锛屽氨鍏佽淇濈暀
+            if ranking_score >= cutoff_score - self.rank_retention_buffer:
+                selected.append(item)
+                selected_pairs.add(pair)
+
+        return selected
+
+    def target_weights(
+            self,
+            features: FeatureMap,
+            risk_on: bool,
+            positions: Dict[str, float],
     ) -> Dict[str, float]:
         if not risk_on or not features:
             return {}
+
         held_pairs = set(positions)
         ranked: List[Tuple[str, Dict[str, float], float, float]] = []
+
         for pair, feature in features.items():
-            threshold = self.cfg.exit_score_threshold if pair in held_pairs else self.cfg.entry_score_threshold
-            if feature["score"] < threshold:
+            is_held = pair in held_pairs
+            threshold = self.cfg.exit_score_threshold if is_held else self.cfg.entry_score_threshold
+            score = feature["score"]
+
+            if score < threshold:
                 continue
-            if pair not in held_pairs:
-                if feature["dist_ma20"] > self.pump_chase_cutoff:
+
+            # --- anti-chase for new entries only ---
+            if not is_held:
+                dist_ma20 = feature.get("dist_ma20", 0.0)
+                pullback20 = feature.get("pullback20", 0.0)
+                ret5 = feature.get("ret5", 0.0)
+                ret15 = feature.get("ret15", 0.0)
+
+                # avoid chasing extended breakouts
+                if dist_ma20 > self.pump_chase_cutoff:
                     continue
-                if feature["pullback20"] < self.pullback_entry_floor:
+                if ret5 > self.pump_chase_cutoff or ret15 > self.pump_chase_cutoff * 1.5:
                     continue
-            ranking_score = feature["score"] + (self.cfg.holding_score_bonus if pair in held_pairs else 0.0)
-            if pair in held_pairs:
-                ranking_score += max(self.cfg.holding_score_bonus, self.holding_bonus_floor)
+
+                # avoid catching overly deep pullbacks
+                if pullback20 < self.pullback_entry_floor:
+                    continue
+            holding_bonus = 0.0
+            if is_held:
+                holding_bonus = max(self.cfg.holding_score_bonus, self.holding_bonus_floor)
+
+            ranking_score = score + holding_bonus
+
+            # 瀵规柊浠撳啀鍔犱竴鐐光€滃埆杩芥定鈥濈殑杞儵缃氾紝鑰屼笉鏄彧闈犵‖杩囨护
+            if not is_held:
+                if feature.get("dist_ma20", 0.0) > self.pump_chase_cutoff * 0.6:
+                    ranking_score -= 0.12
+                if feature.get("ret5", 0.0) > self.pump_chase_cutoff * 0.6:
+                    ranking_score -= 0.10
+                if feature.get("range_position20", 0.5) > 0.92:
+                    ranking_score -= 0.08
+
             ranked.append((pair, feature, ranking_score, threshold))
-        ranked.sort(key=lambda item: (item[2], item[1]["trend_ratio60"], item[1]["ret15"]), reverse=True)
-        if len(ranked) > self.cfg.top_n:
-            cutoff_score = ranked[self.cfg.top_n - 1][2]
-            retained: List[Tuple[str, Dict[str, float], float, float]] = []
-            for item in ranked:
-                pair, feature, ranking_score, _threshold = item
-                if len(retained) < self.cfg.top_n:
-                    retained.append(item)
-                    continue
-                if pair not in held_pairs:
-                    continue
-                if ranking_score + self.rank_retention_buffer < cutoff_score:
-                    continue
-                retained.append(item)
-            ranked = retained
+
+        ranked = self._select_ranked_with_retention(ranked, held_pairs)
         if not ranked:
             return {}
+
         strengths: List[Tuple[str, float]] = []
         for pair, feature, ranking_score, threshold in ranked:
             vol = clamp(feature["vol60"], self.cfg.vol_floor, self.cfg.vol_cap)
-            liquidity_multiplier = clamp(math.log1p(feature["unit_trade_value"] / max(self.cfg.min_24h_dollar_vol, 1.0)), 0.75, 1.35)
-            quality_multiplier = clamp(
-                1.0 + max(feature["trend_ratio60"], 0.0) * 0.08 + feature["efficiency20"] * 0.20,
-                0.80,
-                1.50,
+
+            liquidity_multiplier = clamp(
+                math.log1p(feature["unit_trade_value"] / max(self.cfg.min_24h_dollar_vol, 1.0)),
+                0.75,
+                1.35,
             )
+
+            quality_multiplier = clamp(
+                1.0
+                + max(feature["trend_ratio60"], 0.0) * 0.08
+                + feature["efficiency20"] * 0.20
+                + max(feature.get("pred_mu_z", 0.0), 0.0) * 0.05,
+                0.80,
+                1.55,
+            )
+
+            # 宸叉寔浠撳啀缁欎竴鐐瑰己搴︿繚鎶わ紝鍑忓皯琚?trim / replace
+            if pair in held_pairs:
+                quality_multiplier *= 1.08
+
             edge = max(ranking_score - threshold + 0.20, 0.05)
             strengths.append((pair, (edge * liquidity_multiplier * quality_multiplier) / vol))
+
         return self.capped_inverse_vol_weights(strengths)
 
     def _position_weight_proxy(
@@ -686,46 +1004,181 @@ class MomentumStrategy:
         features: FeatureMap,
         history: Dict[str, Deque[Dict[str, float]]],
     ) -> Dict[str, float]:
-        notional_map: Dict[str, float] = {}
-        for pair, quantity in positions.items():
-            price = features.get(pair, {}).get("price")
-            if price is None and history.get(pair):
-                price = float(history[pair][-1].get("price", 0.0))
-            if price and price > 0:
-                notional_map[pair] = quantity * price
-        total = sum(notional_map.values())
-        if total > 1e-12:
-            return {pair: value / total * self.cfg.target_gross_exposure for pair, value in notional_map.items()}
-        return {}
+        """
+        鐢ㄤ簬鍦ㄦ病鏈夋柊 target锛屾垨鑰呴渶瑕佺粰椋庨櫓灞備竴涓€滅幇鏈変粨浣嶇粨鏋勨€濊緭鍏ユ椂锛?        鏋勯€犱竴涓ǔ瀹氱殑鏉冮噸浠ｇ悊銆?        """
+        if not positions:
+            return {}
 
-    def evaluate_portfolio_risk(
+        strengths: List[Tuple[str, float]] = []
+        for pair, quantity in positions.items():
+            if quantity <= 0:
+                continue
+
+            feature = features.get(pair)
+            if feature is not None:
+                vol = clamp(feature.get("vol60", self.cfg.vol_floor), self.cfg.vol_floor, self.cfg.vol_cap)
+                score = max(feature.get("score", 0.0), 0.0)
+                strength = max(0.05, (0.30 + score) / vol)
+            else:
+                # 娌?feature 鏃堕€€鍖栨垚绛夋潈寮哄害
+                strength = 1.0
+
+            strengths.append((pair, strength))
+
+        if not strengths:
+            return {}
+
+        return self.capped_inverse_vol_weights(strengths)
+
+    def _range_keep_weights(
+        self,
+        positions: Dict[str, float],
+        features: FeatureMap,
+        history: Dict[str, Deque[Dict[str, float]]],
+    ) -> Dict[str, float]:
+        """
+        range 鐜涓嬩笉鐩存帴娓呯┖锛岃€屾槸缁欑幇鏈夋寔浠撲竴涓緝灏忔€绘毚闇茬殑淇濈暀鏉冮噸銆?        """
+        base = self._position_weight_proxy(positions, features, history)
+        if not base:
+            return {}
+
+        total = sum(base.values())
+        if total <= 1e-12:
+            return {}
+
+        target_total = min(self.cfg.target_gross_exposure, self.range_keep_exposure)
+        return {
+            pair: weight / total * target_total
+            for pair, weight in base.items()
+            if weight > 0
+        }
+
+    def _build_risk_universe(
         self,
         history: Dict[str, Deque[Dict[str, float]]],
         trade_pairs: Dict[str, Dict[str, Any]],
-        features: FeatureMap,
         raw_weights: Dict[str, float],
         positions: Dict[str, float],
+    ) -> List[str]:
+        focus_pairs: List[str] = []
+        seen: set[str] = set()
+
+        def add_pair(pair: str) -> None:
+            if pair not in trade_pairs or pair not in history:
+                return
+            if len(history[pair]) <= 0 or pair in seen:
+                return
+            seen.add(pair)
+            focus_pairs.append(pair)
+
+        for pair in raw_weights:
+            add_pair(pair)
+        for pair in positions:
+            add_pair(pair)
+        for pair in ("BTC/USD", "ETH/USD"):
+            add_pair(pair)
+
+        if len(focus_pairs) >= 2:
+            return focus_pairs
+
+        ranked_liquidity = sorted(
+            (
+                pair
+                for pair in trade_pairs
+                if pair in history and len(history[pair]) > 0
+            ),
+            key=lambda pair: float(history[pair][-1].get("unit_trade_value", 0.0)),
+            reverse=True,
+        )
+        for pair in ranked_liquidity:
+            add_pair(pair)
+            if len(focus_pairs) >= 6:
+                break
+        return focus_pairs
+
+    def evaluate_portfolio_risk(
+            self,
+            history: Dict[str, Deque[Dict[str, float]]],
+            trade_pairs: Dict[str, Dict[str, Any]],
+            features: FeatureMap,
+            raw_weights: Dict[str, float],
+            positions: Dict[str, float],
     ) -> PortfolioRiskState:
-        universe = sorted(pair for pair in trade_pairs if pair in history)
+        universe = self._build_risk_universe(history, trade_pairs, raw_weights, positions)
+        risk_frequency = self.cfg.risk_data_frequency
+        if risk_frequency in ("auto", "raw"):
+            risk_frequency = "hourly"
+
         price_df, data_frequency = load_price_data(
             history=history,
             universe=universe,
-            frequency=self.cfg.risk_data_frequency,
+            frequency=risk_frequency,
             min_periods=self.cfg.risk_min_periods,
         )
         returns_df = compute_returns(price_df, method=self.cfg.risk_return_method)
-        cov_matrix = compute_cov_matrix(returns_df, window=self.cfg.risk_cov_window)
+
+        conservative_exposure = (
+            self.cfg.neutral_exposure_multiplier
+            * self.cfg.target_gross_exposure
+            * self.risk_exposure_haircut
+        )
+        minimum_samples = max(20, self.cfg.risk_cov_window // 2)
+        if returns_df.shape[0] < minimum_samples:
+            return PortfolioRiskState(
+                covariance_matrix={},
+                portfolio_volatility=0.0,
+                average_correlation=0.0,
+                market_regime="neutral",
+                risk_score=0.5,
+                target_exposure=conservative_exposure,
+                diversification_breakdown=False,
+                data_frequency=data_frequency,
+                raw_weights=raw_weights,
+                adjusted_weights=raw_weights,
+            )
+
+        cov_matrix = compute_cov_matrix(
+            returns_df,
+            min_samples_per_asset=max(20, self.cfg.risk_cov_window // 2),
+            min_periods_pairwise=max(10, self.cfg.risk_cov_window // 3),
+            shrinkage=0.25,
+        )
+        logger.info(
+            "Risk matrix: returns_shape=%s cov_shape=%s",
+            tuple(returns_df.shape) if not returns_df.empty else (0, 0),
+            tuple(cov_matrix.shape) if not cov_matrix.empty else (0, 0),
+        )
+        if cov_matrix.shape[0] < 2:
+            return PortfolioRiskState(
+                covariance_matrix=cov_matrix.round(8).to_dict() if not cov_matrix.empty else {},
+                portfolio_volatility=0.0,
+                average_correlation=0.0,
+                market_regime="neutral",
+                risk_score=0.5,
+                target_exposure=conservative_exposure,
+                diversification_breakdown=False,
+                data_frequency=data_frequency,
+                raw_weights=raw_weights,
+                adjusted_weights=raw_weights,
+            )
 
         weight_proxy = raw_weights or self._position_weight_proxy(positions, features, history)
         if not weight_proxy and not cov_matrix.empty:
             equal_weight = self.cfg.target_gross_exposure / max(len(cov_matrix.columns), 1)
             weight_proxy = {pair: equal_weight for pair in cov_matrix.columns}
+        weight_proxy = {
+            pair: weight
+            for pair, weight in weight_proxy.items()
+            if pair in cov_matrix.columns and weight > 0
+        }
 
         portfolio_volatility = compute_portfolio_volatility(weight_proxy, cov_matrix)
         average_correlation = compute_average_correlation(
             returns_df=returns_df,
             cov_matrix=cov_matrix,
             window=self.cfg.risk_cov_window,
+            min_samples_per_asset=max(10, self.cfg.risk_cov_window // 3),
+            min_periods_pairwise=max(8, self.cfg.risk_cov_window // 4),
         )
         diversification_breakdown = check_diversification_breakdown(
             average_correlation=average_correlation,
@@ -754,6 +1207,9 @@ class MomentumStrategy:
             diversification_breakdown=diversification_breakdown,
             portfolio_volatility=portfolio_volatility,
         )
+        if len(weight_proxy) < 2:
+            target_exposure *= self.risk_exposure_haircut
+
         return PortfolioRiskState(
             covariance_matrix=cov_matrix.round(8).to_dict() if not cov_matrix.empty else {},
             portfolio_volatility=portfolio_volatility,
@@ -768,15 +1224,33 @@ class MomentumStrategy:
         )
 
     def generate_signals(
-        self,
-        history: Dict[str, Deque[Dict[str, float]]],
-        trade_pairs: Dict[str, Dict[str, Any]],
-        positions: Dict[str, float],
-        prev_risk_on: bool,
+            self,
+            history: Dict[str, Deque[Dict[str, float]]],
+            trade_pairs: Dict[str, Dict[str, Any]],
+            positions: Dict[str, float],
+            prev_risk_on: bool,
     ) -> Dict[str, Any]:
+        symbols = sorted([
+            pair for pair in trade_pairs
+            if pair in history and len(history[pair]) > 0
+        ])
+
         if self.regime_filter is None:
-            symbols = [pair for pair in history if len(history[pair]) > 0]
+            logger.info("Initializing regime filter for %d symbols", len(symbols))
             self.regime_filter = RegimeFilter(symbols)
+        else:
+            old_symbols = set(self.regime_filter.price_history.keys())
+            new_symbols = set(symbols)
+            if old_symbols != new_symbols:
+                added = sorted(new_symbols - old_symbols)
+                removed = sorted(old_symbols - new_symbols)
+                logger.info(
+                    "Updating regime filter symbols. added=%s removed=%s total=%d",
+                    added,
+                    removed,
+                    len(symbols),
+                )
+                self.regime_filter.sync_symbols(symbols)
 
         latest_tickers = {
             pair: {"LastPrice": history[pair][-1]["price"]}
@@ -788,28 +1262,27 @@ class MomentumStrategy:
 
         features = self.compute_features(history, trade_pairs)
         snapshot = self.market_snapshot(features)
-        snapshot_risk_on = self.risk_on(snapshot, prev_risk_on)
-        base_risk_on = regime["regime"] in ["trend", "neutral"] and snapshot_risk_on
-        raw_weights = self.target_weights(features, base_risk_on, positions)
 
         regime_name = regime["regime"]
-        if regime_name == "range" and positions:
-            n = len(positions)
-            if n > 0:
-                raw_weights = {
-                    pair: min(self.cfg.max_single_weight, 0.3 / n)
-                    for pair in positions
-                }
 
-        if raw_weights:
-            multiplier = self.exposure_multiplier(regime_name, snapshot)
-            total = sum(raw_weights.values())
-            if total > 0:
-                raw_weights = {
-                    pair: weight / total * self.cfg.target_gross_exposure * multiplier
-                    for pair, weight in raw_weights.items()
-                }
+        # 绗竴灞傦細鍙仛鏂瑰悜杩囨护锛屼笉鍋氫粨浣嶇缉鏀?        # trend / neutral 鍏佽寮€鏂颁粨锛況ange / panic 涓嶅紑鏂颁粨
+        allow_new_entries = (
+                regime_name in ["trend", "neutral"]
+                and self.risk_on(snapshot, prev_risk_on)
+        )
 
+        # 鍘熷鏂瑰悜灞傜洰鏍囨潈閲嶏細杩欓噷鍙〃杈锯€滄兂涔拌皝鈥濓紝涓嶈〃杈炬渶缁堟€讳粨浣?        raw_weights = self.target_weights(features, allow_new_entries, positions)
+
+        # 濡傛灉澶勪簬 range / panic锛屼笉寮€鏂颁粨锛?        # 浣嗗鏋滃凡缁忔湁鎸佷粨锛屽垯淇濈暀鐜版湁鎸佷粨浣滀负椋庨櫓灞傝緭鍏ワ紝璁╃浜屽眰鍐冲畾缂╁灏戜粨
+        if regime_name == "range":
+            if positions:
+                raw_weights = self._range_keep_weights(positions, features, history)
+            else:
+                raw_weights = {}
+        elif regime_name == "panic":
+            raw_weights = {}
+
+        # 绗簩灞傦細鍙礋璐ｉ闄╄鐩栦笌浠撲綅缂╂斁
         portfolio_risk = self.evaluate_portfolio_risk(
             history=history,
             trade_pairs=trade_pairs,
@@ -818,7 +1291,9 @@ class MomentumStrategy:
             positions=positions,
         )
 
-        risk_on = base_risk_on and portfolio_risk.market_regime != "risk_off"
+        # 鏈€缁?risk_on 鍙〃绀衡€滄槸鍚﹀厑璁告柊澧為闄┾€?        # risk_off 鏃朵笉鏂板锛況ange / panic 鏃朵篃涓嶆柊澧?        risk_on = allow_new_entries and portfolio_risk.market_regime != "risk_off"
+
+        # 绗簩灞傚厛璋冪粨鏋勶紝鍐嶇粺涓€缂╂斁鎬?exposure
         final_weights = portfolio_risk.adjusted_weights or raw_weights
         if final_weights:
             total = sum(final_weights.values())
@@ -827,6 +1302,8 @@ class MomentumStrategy:
                     pair: weight / total * portfolio_risk.target_exposure
                     for pair, weight in final_weights.items()
                 }
+            else:
+                final_weights = {}
 
         return {
             "features": features,
@@ -846,5 +1323,12 @@ class MomentumStrategy:
                 "raw_weights": portfolio_risk.raw_weights,
                 "adjusted_weights": final_weights,
             },
-            "regime": regime,
+            "regime": {
+                **regime,
+                "mu_ready": self.mu_model.ready,
+                "mu_blend_weight": self.mu_weight,
+                "fixed_blend_weight": self.fixed_weight,
+                "mu_error": self.mu_model.error,
+            },
         }
+
