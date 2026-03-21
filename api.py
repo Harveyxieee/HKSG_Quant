@@ -109,7 +109,7 @@ class RoostooClient:
 
         url = f"{self.cfg.base_url}{path}"
         last_exc: Optional[Exception] = None
-        max_attempts = self.cfg.max_retries if retry_safe else 1
+        max_attempts = (1 + self.cfg.max_retries) if retry_safe else 1
         for attempt in range(1, max_attempts + 1):
             resp = None
             try:

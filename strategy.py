@@ -10,6 +10,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import deque
 import numpy as np
 import pandas as pd
+import logging
+logger = logging.getLogger(__name__)
 
 
 FeatureMap = Dict[str, Dict[str, float]]
@@ -142,15 +144,35 @@ def compute_returns(price_df: pd.DataFrame, method: str = "pct_change") -> pd.Da
     return returns_df
 
 
-def compute_cov_matrix(returns_df: pd.DataFrame, window: int) -> pd.DataFrame:
+def compute_cov_matrix(
+    returns_df: pd.DataFrame,
+    min_samples_per_asset: int = 30,
+    min_periods_pairwise: int = 20,
+) -> pd.DataFrame:
     if returns_df.empty:
         return pd.DataFrame()
-    sample = returns_df.tail(window).dropna(how="all")
-    sample = sample.loc[:, sample.notna().sum() >= 2]
-    sample = sample.dropna(axis=0, how="any")
-    if len(sample) < 2 or sample.empty:
+
+    # 1) 先删掉几乎没数据的资产列
+    valid_counts = returns_df.notna().sum(axis=0)
+    keep_cols = valid_counts[valid_counts >= min_samples_per_asset].index.tolist()
+    returns_df = returns_df[keep_cols]
+
+    if returns_df.shape[1] == 0:
         return pd.DataFrame()
-    return sample.cov()
+
+    # 2) 不再整表 dropna(any)，而是用 pairwise covariance
+    cov = returns_df.cov(min_periods=min_periods_pairwise)
+
+    # 3) 对角线（单资产方差）至少要有值
+    for col in cov.columns:
+        if pd.isna(cov.loc[col, col]):
+            asset_var = returns_df[col].var()
+            cov.loc[col, col] = asset_var if pd.notna(asset_var) else 0.0
+
+    # 4) 非对角缺失先补 0，表示“协方差未知时不过度惩罚”
+    cov = cov.fillna(0.0)
+
+    return cov
 
 
 def compute_portfolio_volatility(weights: Dict[str, float], cov_matrix: pd.DataFrame) -> float:
@@ -169,29 +191,52 @@ def compute_average_correlation(
     returns_df: Optional[pd.DataFrame] = None,
     cov_matrix: Optional[pd.DataFrame] = None,
     window: int = 60,
+    min_samples_per_asset: int = 30,
+    min_periods_pairwise: int = 20,
 ) -> float:
     if returns_df is not None and not returns_df.empty:
         sample = returns_df.tail(window).dropna(how="all")
-        sample = sample.loc[:, sample.notna().sum() >= 2]
-        sample = sample.dropna(axis=0, how="any")
-        if sample.shape[1] < 2 or len(sample) < 2:
+        if sample.empty:
             return 0.0
-        corr_matrix = sample.corr()
+
+        valid_counts = sample.notna().sum(axis=0)
+        keep_cols = valid_counts[valid_counts >= min_samples_per_asset].index.tolist()
+        sample = sample[keep_cols]
+
+        if sample.shape[1] < 2:
+            return 0.0
+
+        corr_matrix = sample.corr(min_periods=min_periods_pairwise)
+
     elif cov_matrix is not None and not cov_matrix.empty:
         diag = np.sqrt(np.maximum(np.diag(cov_matrix.to_numpy(dtype=float)), 0.0))
         denom = np.outer(diag, diag)
         with np.errstate(divide="ignore", invalid="ignore"):
-            corr_values = np.divide(cov_matrix.to_numpy(dtype=float), denom, where=denom > 0)
-        corr_matrix = pd.DataFrame(corr_values, index=cov_matrix.index, columns=cov_matrix.columns)
+            corr_values = np.divide(
+                cov_matrix.to_numpy(dtype=float),
+                denom,
+                where=denom > 0,
+            )
+        corr_matrix = pd.DataFrame(
+            corr_values,
+            index=cov_matrix.index,
+            columns=cov_matrix.columns,
+        )
     else:
         return 0.0
 
     if corr_matrix.shape[0] < 2:
         return 0.0
-    mask = ~np.eye(corr_matrix.shape[0], dtype=bool)
-    values = corr_matrix.to_numpy(dtype=float)[mask]
-    finite = values[np.isfinite(values)]
-    return float(finite.mean()) if finite.size else 0.0
+
+    values = []
+    cols = corr_matrix.columns.tolist()
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            v = corr_matrix.iloc[i, j]
+            if pd.notna(v) and np.isfinite(v):
+                values.append(float(v))
+
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 def check_diversification_breakdown(average_correlation: float, threshold: float) -> bool:
@@ -292,12 +337,18 @@ def adjust_weights_by_risk(
         asset_volatility = {pair: float(diag[idx]) for idx, pair in enumerate(common)}
         corr_sample = returns_df.tail(cfg.risk_cov_window).dropna(how="all")
         corr_sample = corr_sample.loc[:, [pair for pair in common if pair in corr_sample.columns]]
-        corr_sample = corr_sample.dropna(axis=0, how="any")
-        if corr_sample.shape[1] >= 2 and len(corr_sample) >= 2:
-            corr_matrix = corr_sample.corr()
-            for pair in corr_matrix.columns:
-                others = corr_matrix.loc[pair, corr_matrix.columns != pair]
-                asset_correlation[pair] = float(others.mean()) if len(others) else 0.0
+
+        if not corr_sample.empty and corr_sample.shape[1] >= 2:
+            valid_counts = corr_sample.notna().sum(axis=0)
+            keep_cols = valid_counts[valid_counts >= max(10, cfg.risk_cov_window // 3)].index.tolist()
+            corr_sample = corr_sample[keep_cols]
+
+            if corr_sample.shape[1] >= 2:
+                corr_matrix = corr_sample.corr(min_periods=max(8, cfg.risk_cov_window // 4))
+                for pair in corr_matrix.columns:
+                    others = corr_matrix.loc[pair, corr_matrix.columns != pair]
+                    others = others[np.isfinite(others)]
+                    asset_correlation[pair] = float(others.mean()) if len(others) else 0.0
 
     positive_vols = [value for value in asset_volatility.values() if value > 0]
     median_volatility = median(positive_vols) if positive_vols else 0.0
@@ -342,10 +393,32 @@ def adjust_weights_by_risk(
 
 class RegimeFilter:
     def __init__(self, symbols: List[str], btc_symbol: str = "BTC/USD", maxlen: int = 200):
-        self.symbols = symbols
+        self.symbols = list(symbols)
         self.btc_symbol = btc_symbol
+        self.maxlen = maxlen
         self.price_history = {s: deque(maxlen=maxlen) for s in symbols}
         self.current_regime = None
+
+    def sync_symbols(self, symbols: List[str]) -> None:
+        """
+        universe 变化时保留已有 symbol 的历史，只增删映射，不整对象重建。
+        """
+        new_symbols = list(symbols)
+        new_set = set(new_symbols)
+        old_set = set(self.price_history.keys())
+
+        # 新增 symbol：创建新 deque
+        for symbol in new_symbols:
+            if symbol not in self.price_history:
+                self.price_history[symbol] = deque(maxlen=self.maxlen)
+
+        # 删除不再需要的 symbol
+        for symbol in list(old_set - new_set):
+            self.price_history.pop(symbol, None)
+
+        # 保持迭代顺序与当前 universe 一致
+        self.symbols = new_symbols
+        self.price_history = {symbol: self.price_history[symbol] for symbol in self.symbols}
 
     def update_market_data(self, tickers: Dict[str, Dict[str, float]]) -> None:
         for symbol in self.symbols:
@@ -355,7 +428,14 @@ class RegimeFilter:
                     self.price_history[symbol].append(float(price))
 
     def _to_df(self) -> pd.DataFrame:
-        df = pd.DataFrame({k: list(v) for k, v in self.price_history.items()})
+        non_empty = {
+            k: list(v)
+            for k, v in self.price_history.items()
+            if len(v) > 0
+        }
+        if not non_empty:
+            return pd.DataFrame()
+        df = pd.DataFrame(non_empty)
         return df.ffill().dropna(how="all")
 
     def detect_regime(self) -> Dict[str, float]:
@@ -365,7 +445,7 @@ class RegimeFilter:
             self.current_regime = {"regime": "neutral", "risk_multiplier": 0.5}
             return self.current_regime
 
-        returns_df = price_df.pct_change()
+        returns_df = price_df.pct_change(fill_method=None)
         btc_price = price_df[self.btc_symbol]
         ma = btc_price.rolling(min(50, len(btc_price))).mean()
         if len(btc_price) < 10 or np.isnan(ma.iloc[-1]):
@@ -430,16 +510,12 @@ class RegimeFilter:
 
 
 class MuModelWrapper:
-    """Lightweight XGBoost model loader for full-universe inference.
-
-    Expects model saved with XGBRegressor.save_model and metadata json:
-      {
-        "feature_names": [...],
-        "feature_defaults": {name: 0.0, ...}
-      }
-    """
-
-    def __init__(self, model_path: Optional[str], meta_path: Optional[str]):
+    def __init__(
+        self,
+        model_path: Optional[str],
+        meta_path: Optional[str],
+        required: bool = False,
+    ):
         self.model = None
         self.feature_names: List[str] = []
         self.feature_defaults: Dict[str, float] = {}
@@ -447,15 +523,25 @@ class MuModelWrapper:
         self.error: Optional[str] = None
         self.model_path = model_path
         self.meta_path = meta_path
+        self.required = required
         self._load()
 
     def _load(self) -> None:
         if not self.model_path or not self.meta_path:
             self.error = "MU_MODEL_PATH or MU_MODEL_META_PATH missing"
+            if self.required:
+                raise RuntimeError(self.error)
             return
+
         if not Path(self.model_path).exists() or not Path(self.meta_path).exists():
-            self.error = "mu model or metadata file not found"
+            self.error = (
+                f"mu model or metadata file not found: "
+                f"model_path={self.model_path}, meta_path={self.meta_path}"
+            )
+            if self.required:
+                raise RuntimeError(self.error)
             return
+
         try:
             from xgboost import XGBRegressor
 
@@ -465,7 +551,6 @@ class MuModelWrapper:
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
 
-            # 兼容新旧 metadata
             feature_names = meta.get("feature_names")
             if not feature_names:
                 feature_names = meta.get("feature_columns", [])
@@ -486,18 +571,29 @@ class MuModelWrapper:
             self.error = None
 
         except Exception as exc:
-            self.error = str(exc)
+            self.error = f"failed to load MU model: {exc}"
             self.ready = False
+            if self.required:
+                raise RuntimeError(self.error) from exc
 
     def predict(self, rows: List[Dict[str, float]]) -> List[float]:
         if not self.ready or self.model is None:
+            if self.required:
+                raise RuntimeError(
+                    f"MU model unavailable during predict: {self.error or 'unknown error'}"
+                )
             return [0.0 for _ in rows]
+
         import pandas as pd
 
         frame_rows = []
         for row in rows:
-            data = {name: row.get(name, self.feature_defaults.get(name, 0.0)) for name in self.feature_names}
+            data = {
+                name: row.get(name, self.feature_defaults.get(name, 0.0))
+                for name in self.feature_names
+            }
             frame_rows.append(data)
+
         X = pd.DataFrame(frame_rows, columns=self.feature_names)
         preds = self.model.predict(X)
         return [float(x) for x in preds]
@@ -515,7 +611,20 @@ class MomentumStrategy:
 
         self.mu_model_path = os.getenv("MU_MODEL_PATH", str(default_model_path))
         self.mu_model_meta_path = os.getenv("MU_MODEL_META_PATH", str(default_meta_path))
-        self.mu_model = MuModelWrapper(self.mu_model_path, self.mu_model_meta_path)
+
+        self.mu_model_required = (
+                os.getenv("MU_MODEL_REQUIRED", "true").strip().lower() == "true"
+        )
+
+        logger.info("MU model path=%s", self.mu_model_path)
+        logger.info("MU meta path=%s", self.mu_model_meta_path)
+        logger.info("MU model required=%s", self.mu_model_required)
+
+        self.mu_model = MuModelWrapper(
+            self.mu_model_path,
+            self.mu_model_meta_path,
+            required=self.mu_model_required,
+        )
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -844,7 +953,32 @@ class MomentumStrategy:
             min_periods=self.cfg.risk_min_periods,
         )
         returns_df = compute_returns(price_df, method=self.cfg.risk_return_method)
-        cov_matrix = compute_cov_matrix(returns_df, window=self.cfg.risk_cov_window)
+
+        # 样本太少时，直接给一个保守但可运行的默认风险状态
+        if returns_df.shape[0] < max(20, self.cfg.risk_cov_window // 2):
+            return PortfolioRiskState(
+                covariance_matrix={},
+                portfolio_volatility=0.0,
+                average_correlation=0.0,
+                market_regime="neutral",
+                risk_score=0.5,
+                target_exposure=self.cfg.neutral_exposure_multiplier * self.cfg.target_gross_exposure,
+                diversification_breakdown=False,
+                data_frequency=data_frequency,
+                raw_weights=raw_weights,
+                adjusted_weights=raw_weights,
+            )
+
+        cov_matrix = compute_cov_matrix(
+            returns_df,
+            min_samples_per_asset=max(20, self.cfg.risk_cov_window // 2),
+            min_periods_pairwise=max(10, self.cfg.risk_cov_window // 3),
+        )
+        logger.info(
+            "Risk matrix: returns_shape=%s cov_shape=%s",
+            tuple(returns_df.shape) if not returns_df.empty else (0, 0),
+            tuple(cov_matrix.shape) if not cov_matrix.empty else (0, 0),
+        )
 
         weight_proxy = raw_weights or self._position_weight_proxy(positions, features, history)
         if not weight_proxy and not cov_matrix.empty:
@@ -905,9 +1039,27 @@ class MomentumStrategy:
             positions: Dict[str, float],
             prev_risk_on: bool,
     ) -> Dict[str, Any]:
+        symbols = sorted([
+            pair for pair in trade_pairs
+            if pair in history and len(history[pair]) > 0
+        ])
+
         if self.regime_filter is None:
-            symbols = [pair for pair in history if len(history[pair]) > 0]
+            logger.info("Initializing regime filter for %d symbols", len(symbols))
             self.regime_filter = RegimeFilter(symbols)
+        else:
+            old_symbols = set(self.regime_filter.price_history.keys())
+            new_symbols = set(symbols)
+            if old_symbols != new_symbols:
+                added = sorted(new_symbols - old_symbols)
+                removed = sorted(old_symbols - new_symbols)
+                logger.info(
+                    "Updating regime filter symbols. added=%s removed=%s total=%d",
+                    added,
+                    removed,
+                    len(symbols),
+                )
+                self.regime_filter.sync_symbols(symbols)
 
         latest_tickers = {
             pair: {"LastPrice": history[pair][-1]["price"]}
@@ -920,40 +1072,27 @@ class MomentumStrategy:
         features = self.compute_features(history, trade_pairs)
         snapshot = self.market_snapshot(features)
 
-        # 先保留你原版的 risk_on 逻辑
-        base_risk_on = regime["regime"] in ["trend", "neutral"] and self.risk_on(snapshot, prev_risk_on)
-
-        # 先生成原始目标权重：这里仍然保留 ML + fixed score 排名
-        raw_weights = self.target_weights(features, base_risk_on, positions)
-
         regime_name = regime["regime"]
-        if regime_name == "range" and positions:
-            n = len(positions)
-            if n > 0:
-                raw_weights = {
-                    p: min(self.cfg.max_single_weight, 0.30 / n)
-                    for p in positions
-                }
 
-        # 先做你原来的 regime exposure scaling
-        if raw_weights:
-            if regime_name == "range":
-                multiplier = 1.0
-            elif regime_name == "neutral":
-                multiplier = 0.6
-            elif regime_name == "trend":
-                multiplier = 1.0
+        # 第一层：只做方向过滤，不做仓位缩放
+        # trend / neutral 允许开新仓；range / panic 不开新仓
+        allow_new_entries = (
+                regime_name in ["trend", "neutral"]
+                and self.risk_on(snapshot, prev_risk_on)
+        )
+
+        # 原始方向层目标权重：这里只表达“想买谁”，不表达最终总仓位
+        raw_weights = self.target_weights(features, allow_new_entries, positions)
+
+        # 如果处于 range / panic，不开新仓；
+        # 但如果已经有持仓，则保留现有持仓作为风险层输入，让第二层决定缩多少仓
+        if regime_name in ["range", "panic"]:
+            if positions:
+                raw_weights = self._position_weight_proxy(positions, features, history)
             else:
-                multiplier = 0.0
+                raw_weights = {}
 
-            total = sum(raw_weights.values())
-            if total > 0:
-                raw_weights = {
-                    p: w / total * self.cfg.target_gross_exposure * multiplier
-                    for p, w in raw_weights.items()
-                }
-
-        # 再叠加 portfolio risk overlay
+        # 第二层：只负责风险覆盖与仓位缩放
         portfolio_risk = self.evaluate_portfolio_risk(
             history=history,
             trade_pairs=trade_pairs,
@@ -962,9 +1101,11 @@ class MomentumStrategy:
             positions=positions,
         )
 
-        # 最终 risk_on 要同时考虑组合风险状态
-        risk_on = base_risk_on and portfolio_risk.market_regime != "risk_off"
+        # 最终 risk_on 只表示“是否允许新增风险”
+        # risk_off 时不新增；range / panic 时也不新增
+        risk_on = allow_new_entries and portfolio_risk.market_regime != "risk_off"
 
+        # 第二层先调结构，再统一缩放总 exposure
         final_weights = portfolio_risk.adjusted_weights or raw_weights
         if final_weights:
             total = sum(final_weights.values())
@@ -973,6 +1114,8 @@ class MomentumStrategy:
                     pair: weight / total * portfolio_risk.target_exposure
                     for pair, weight in final_weights.items()
                 }
+            else:
+                final_weights = {}
 
         return {
             "features": features,
