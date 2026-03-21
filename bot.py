@@ -277,6 +277,7 @@ class PositionMeta:
     last_trade_ts: int
     last_signal_score: float
     last_reason: str = ""
+    not_in_targets_bars: int = 0
 
 
 @dataclass
@@ -893,16 +894,74 @@ class RoostooMomentumBot:
         meta.last_signal_score = score
         return meta
 
-    def exit_reasons(self, pair: str, meta: PositionMeta, price: float, score: float, targets: Dict[str, float]) -> List[str]:
+    def update_not_in_targets_counter(
+            self,
+            meta: PositionMeta,
+            pair: str,
+            targets: Dict[str, float],
+    ) -> int:
+        """
+        只有当 pair 不在 targets 或目标权重极小的时候，才累计计数。
+        一旦重新回到 targets，就清零。
+        """
+        target_weight = float(targets.get(pair, 0.0))
+        if target_weight > 1e-12:
+            meta.not_in_targets_bars = 0
+        else:
+            meta.not_in_targets_bars += 1
+        return meta.not_in_targets_bars
+
+    def not_in_targets_confirmed(
+            self,
+            meta: PositionMeta,
+            confirm_bars: int = 3,
+    ) -> bool:
+        return meta.not_in_targets_bars >= confirm_bars
+
+    def exit_reasons(
+            self,
+            pair: str,
+            meta: PositionMeta,
+            price: float,
+            score: float,
+            targets: Dict[str, float],
+    ) -> List[str]:
         reasons: List[str] = []
+
+        # 1) 价格型风控：始终立即执行，绝不延迟
         if price <= meta.entry_price * (1 - self.cfg.per_position_stop_loss):
             reasons.append("stop_loss")
         if price <= meta.highest_price * (1 - self.cfg.per_position_trailing_stop):
             reasons.append("trailing_stop")
-        if score < self.cfg.exit_score_threshold:
-            reasons.append("score_decay")
-        if pair not in targets:
-            reasons.append("not_in_targets")
+
+        # 2) 先更新 not_in_targets 计数
+        target_weight = float(targets.get(pair, 0.0))
+        not_in_targets_count = self.update_not_in_targets_counter(meta, pair, targets)
+        in_targets = target_weight > 1e-12
+        confirmed_not_in_targets = self.not_in_targets_confirmed(meta, confirm_bars=3)
+
+        # 3) score_decay 的处理分两种情况：
+        #    - 仍在 targets 内：保持原逻辑，立即执行
+        #    - 已不在 targets：必须等 not_in_targets 也确认后，才允许触发退出
+        score_decay = score < self.cfg.exit_score_threshold
+
+        if in_targets:
+            if score_decay:
+                reasons.append("score_decay")
+        else:
+            if confirmed_not_in_targets:
+                if score_decay:
+                    reasons.append("score_decay")
+                reasons.append("not_in_targets")
+            else:
+                logger.info(
+                    "Hold %s pending not_in_targets confirmation: %d/3 bars score_decay=%s",
+                    pair,
+                    not_in_targets_count,
+                    score_decay,
+                )
+
+        meta.last_reason = "+".join(reasons) if reasons else "hold"
         return reasons
 
     def manage_existing_positions(
@@ -921,8 +980,8 @@ class RoostooMomentumBot:
             fresh_ok, fresh_reason = self.pair_freshness_status(pair)
 
             # 没有 feature 或数据不 fresh 时：
-            # 1) 不做基于 score 的主动止盈止损退出
-            # 2) 但仍保留价格型风控（stop loss / trailing stop）
+            # 1) 不做基于 score 的主动退出
+            # 2) 但仍保留价格型风控
             if feature is None or not fresh_ok:
                 prev_meta = self.position_meta(pair)
                 fallback_score = prev_meta.last_signal_score if prev_meta is not None else 0.0
@@ -941,7 +1000,11 @@ class RoostooMomentumBot:
 
                     sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
                     if sell_quantity <= 0:
-                        logger.info(...)
+                        logger.info(
+                            "Skip SELL %s because normalized quantity is too small. raw_qty=%.12f",
+                            pair,
+                            quantity,
+                        )
                         meta.last_reason = "sell_qty_too_small"
                         self.set_position_meta(meta)
                         continue
@@ -962,6 +1025,8 @@ class RoostooMomentumBot:
                             sell_quantity,
                             exc,
                         )
+                        meta.last_reason = "sell_unknown_state"
+                        self.set_position_meta(meta)
                         continue
                     except Exception as exc:
                         logger.exception(
@@ -970,12 +1035,16 @@ class RoostooMomentumBot:
                             sell_quantity,
                             exc,
                         )
+                        meta.last_reason = "sell_failed"
+                        self.set_position_meta(meta)
                         continue
 
                     if ok:
                         if sell_quantity >= quantity * 0.999999:
                             self.remove_position_meta(pair)
                         self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                    else:
+                        self.set_position_meta(meta)
                     continue
 
                 meta.last_reason = "hold_stale" if not fresh_ok else "hold_no_feature"
@@ -992,6 +1061,7 @@ class RoostooMomentumBot:
             score = feature["score"]
             meta = self.build_position_meta(pair, quantity, price, score)
             reasons = self.exit_reasons(pair, meta, price, score, targets)
+
             if reasons:
                 sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
                 if sell_quantity <= 0:
@@ -1000,6 +1070,8 @@ class RoostooMomentumBot:
                         pair,
                         quantity,
                     )
+                    meta.last_reason = "sell_qty_too_small"
+                    self.set_position_meta(meta)
                     continue
 
                 try:
@@ -1018,6 +1090,8 @@ class RoostooMomentumBot:
                         sell_quantity,
                         exc,
                     )
+                    meta.last_reason = "sell_unknown_state"
+                    self.set_position_meta(meta)
                     continue
                 except Exception as exc:
                     logger.exception(
@@ -1026,12 +1100,16 @@ class RoostooMomentumBot:
                         sell_quantity,
                         exc,
                     )
+                    meta.last_reason = "sell_failed"
+                    self.set_position_meta(meta)
                     continue
 
                 if ok:
                     if sell_quantity >= quantity * 0.999999:
                         self.remove_position_meta(pair)
                     self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                else:
+                    self.set_position_meta(meta)
                 continue
 
             self.set_position_meta(meta)
