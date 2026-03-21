@@ -148,11 +148,11 @@ def compute_cov_matrix(
     returns_df: pd.DataFrame,
     min_samples_per_asset: int = 30,
     min_periods_pairwise: int = 20,
+    shrinkage: float = 0.25,
 ) -> pd.DataFrame:
     if returns_df.empty:
         return pd.DataFrame()
 
-    # 1) 先删掉几乎没数据的资产列
     valid_counts = returns_df.notna().sum(axis=0)
     keep_cols = valid_counts[valid_counts >= min_samples_per_asset].index.tolist()
     returns_df = returns_df[keep_cols]
@@ -160,19 +160,17 @@ def compute_cov_matrix(
     if returns_df.shape[1] == 0:
         return pd.DataFrame()
 
-    # 2) 不再整表 dropna(any)，而是用 pairwise covariance
     cov = returns_df.cov(min_periods=min_periods_pairwise)
-
-    # 3) 对角线（单资产方差）至少要有值
     for col in cov.columns:
         if pd.isna(cov.loc[col, col]):
             asset_var = returns_df[col].var()
             cov.loc[col, col] = asset_var if pd.notna(asset_var) else 0.0
 
-    # 4) 非对角缺失先补 0，表示“协方差未知时不过度惩罚”
     cov = cov.fillna(0.0)
-
-    return cov
+    cov_values = cov.to_numpy(dtype=float)
+    diag_values = np.diag(np.diag(cov_values))
+    shrunk = (1.0 - shrinkage) * cov_values + shrinkage * diag_values
+    return pd.DataFrame(shrunk, index=cov.index, columns=cov.columns)
 
 
 def compute_portfolio_volatility(weights: Dict[str, float], cov_matrix: pd.DataFrame) -> float:
@@ -634,6 +632,7 @@ class MomentumStrategy:
         self.pump_chase_cutoff = 0.035
         self.pullback_entry_floor = -0.025
         self.range_keep_exposure = 0.30
+        self.risk_exposure_haircut = 0.60
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -1062,6 +1061,49 @@ class MomentumStrategy:
             if weight > 0
         }
 
+    def _build_risk_universe(
+        self,
+        history: Dict[str, Deque[Dict[str, float]]],
+        trade_pairs: Dict[str, Dict[str, Any]],
+        raw_weights: Dict[str, float],
+        positions: Dict[str, float],
+    ) -> List[str]:
+        focus_pairs: List[str] = []
+        seen: set[str] = set()
+
+        def add_pair(pair: str) -> None:
+            if pair not in trade_pairs or pair not in history:
+                return
+            if len(history[pair]) <= 0 or pair in seen:
+                return
+            seen.add(pair)
+            focus_pairs.append(pair)
+
+        for pair in raw_weights:
+            add_pair(pair)
+        for pair in positions:
+            add_pair(pair)
+        for pair in ("BTC/USD", "ETH/USD"):
+            add_pair(pair)
+
+        if len(focus_pairs) >= 2:
+            return focus_pairs
+
+        ranked_liquidity = sorted(
+            (
+                pair
+                for pair in trade_pairs
+                if pair in history and len(history[pair]) > 0
+            ),
+            key=lambda pair: float(history[pair][-1].get("unit_trade_value", 0.0)),
+            reverse=True,
+        )
+        for pair in ranked_liquidity:
+            add_pair(pair)
+            if len(focus_pairs) >= 6:
+                break
+        return focus_pairs
+
     def evaluate_portfolio_risk(
             self,
             history: Dict[str, Deque[Dict[str, float]]],
@@ -1070,15 +1112,29 @@ class MomentumStrategy:
             raw_weights: Dict[str, float],
             positions: Dict[str, float],
     ) -> PortfolioRiskState:
-        universe = sorted(pair for pair in trade_pairs if pair in history)
+        universe = self._build_risk_universe(
+            history=history,
+            trade_pairs=trade_pairs,
+            raw_weights=raw_weights,
+            positions=positions,
+        )
+        risk_frequency = self.cfg.risk_data_frequency
+        if risk_frequency in ("auto", "raw"):
+            risk_frequency = "hourly"
 
         price_df, data_frequency = load_price_data(
             history=history,
             universe=universe,
-            frequency=self.cfg.risk_data_frequency,
+            frequency=risk_frequency,
             min_periods=self.cfg.risk_min_periods,
         )
         returns_df = compute_returns(price_df, method=self.cfg.risk_return_method)
+
+        conservative_exposure = (
+                self.cfg.neutral_exposure_multiplier
+                * self.cfg.target_gross_exposure
+                * self.risk_exposure_haircut
+        )
 
         # 样本太少时，直接给一个保守但可运行的默认风险状态
         if returns_df.shape[0] < max(20, self.cfg.risk_cov_window // 2):
@@ -1088,7 +1144,7 @@ class MomentumStrategy:
                 average_correlation=0.0,
                 market_regime="neutral",
                 risk_score=0.5,
-                target_exposure=self.cfg.neutral_exposure_multiplier * self.cfg.target_gross_exposure,
+                target_exposure=conservative_exposure,
                 diversification_breakdown=False,
                 data_frequency=data_frequency,
                 raw_weights=raw_weights,
