@@ -7,6 +7,7 @@ import math
 import time
 import zipfile
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Tuple
@@ -31,6 +32,25 @@ AGG_TRADE_COLUMNS = [
     "is_best_match",
 ]
 DEFAULT_FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+
+
+@dataclass
+class SimPositionMeta:
+    pair: str
+    quantity: float
+    entry_price: float
+    highest_price: float
+    last_trade_ts: int
+    last_signal_score: float
+    last_reason: str = ""
+
+
+@dataclass
+class SimBacktestState:
+    peak_equity: float = 0.0
+    cooldown_until: Dict[str, int] = field(default_factory=dict)
+    positions_meta: Dict[str, SimPositionMeta] = field(default_factory=dict)
+    risk_on: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rebalance-minutes",
         type=int,
-        default=30,
-        help="Rebalance interval in minutes. Default: 30 to cap execution at one trade every half hour",
+        default=10,
+        help="Rebalance interval in minutes. Default: 10 to cap execution at most once every 10 minutes",
     )
     parser.add_argument(
         "--fee-rate",
@@ -293,6 +313,18 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def round_down(value: float, decimals: int) -> float:
+    factor = 10 ** decimals
+    return math.floor(value * factor) / factor
+
+
 def build_history_buffers(
     pair_to_symbol: Dict[str, str],
     cfg: Config,
@@ -374,7 +406,7 @@ def score_total_backtest(
 
     universe_ratio = executed_symbols / requested_symbols if requested_symbols > 0 else 0.0
     score_validity = clamp(universe_ratio * 5.0, 0.0, 5.0)
-    score_compliance = 5.0 if rebalance_minutes >= 30 else clamp(rebalance_minutes / 30.0 * 5.0, 0.0, 5.0)
+    score_compliance = 5.0 if rebalance_minutes >= 10 else clamp(rebalance_minutes / 10.0 * 5.0, 0.0, 5.0)
 
     total_score = clamp(
         score_base + score_return + score_risk_adjusted + score_drawdown + score_validity + score_compliance,
@@ -439,6 +471,122 @@ def score_trade_point(
     }
 
 
+def mark_to_market_equity(cash: float, quantities: Dict[str, float], prices: Dict[str, float]) -> float:
+    return cash + sum(
+        quantity * prices[pair]
+        for pair, quantity in quantities.items()
+        if pair in prices and prices[pair] > 0
+    )
+
+
+def current_notional(quantities: Dict[str, float], prices: Dict[str, float]) -> Dict[str, float]:
+    return {
+        pair: quantity * prices[pair]
+        for pair, quantity in quantities.items()
+        if pair in prices and prices[pair] > 0
+    }
+
+
+def sync_position_meta(
+    state: SimBacktestState,
+    quantities: Dict[str, float],
+    prices: Dict[str, float],
+    ts_ms: int,
+) -> None:
+    live_pairs = set(quantities)
+    for pair in list(state.positions_meta):
+        if pair not in live_pairs:
+            state.positions_meta.pop(pair, None)
+    for pair, quantity in quantities.items():
+        price = prices.get(pair, 0.0)
+        meta = state.positions_meta.get(pair)
+        if meta is None:
+            state.positions_meta[pair] = SimPositionMeta(
+                pair=pair,
+                quantity=quantity,
+                entry_price=price,
+                highest_price=price,
+                last_trade_ts=ts_ms,
+                last_signal_score=0.0,
+                last_reason="recovered_from_balance",
+            )
+        else:
+            meta.quantity = quantity
+
+
+def rebalance_notional_threshold(cfg: Config, equity: float) -> float:
+    return max(cfg.min_rebalance_notional, equity * cfg.rebalance_threshold)
+
+
+def quantity_for_notional(cfg: Config, trade_pairs: Dict[str, Dict[str, Any]], pair: str, notional_usd: float, price: float) -> float:
+    rules = trade_pairs.get(pair, {})
+    amount_precision = int(rules.get("AmountPrecision", 6))
+    min_order = safe_float(rules.get("MiniOrder", 1.0))
+    if price <= 0:
+        return 0.0
+    quantity = round_down(notional_usd / price, amount_precision)
+    if quantity <= 0 or quantity * price < min_order:
+        return 0.0
+    return quantity
+
+
+def quantity_for_fraction(
+    cfg: Config,
+    trade_pairs: Dict[str, Dict[str, Any]],
+    pair: str,
+    quantity: float,
+    price: float,
+    fraction: float,
+) -> float:
+    if quantity <= 0 or price <= 0:
+        return 0.0
+    fraction = clamp(fraction, 0.0, 1.0)
+    if fraction <= 0:
+        return 0.0
+    if fraction >= 1.0:
+        return quantity
+    return min(quantity, quantity_for_notional(cfg, trade_pairs, pair, quantity * price * fraction, price))
+
+
+def build_position_meta(state: SimBacktestState, pair: str, quantity: float, price: float, score: float, ts_ms: int) -> SimPositionMeta:
+    meta = state.positions_meta.get(pair)
+    if meta is None:
+        meta = SimPositionMeta(
+            pair=pair,
+            quantity=quantity,
+            entry_price=price,
+            highest_price=price,
+            last_trade_ts=ts_ms,
+            last_signal_score=score,
+            last_reason="recovered_from_balance",
+        )
+    meta.quantity = quantity
+    meta.highest_price = max(meta.highest_price, price)
+    meta.last_signal_score = score
+    return meta
+
+
+def exit_reasons(cfg: Config, pair: str, meta: SimPositionMeta, price: float, score: float, targets: Dict[str, float]) -> List[str]:
+    reasons: List[str] = []
+    if price <= meta.entry_price * (1 - cfg.per_position_stop_loss):
+        reasons.append("stop_loss")
+    if price <= meta.highest_price * (1 - cfg.per_position_trailing_stop):
+        reasons.append("trailing_stop")
+    if score < cfg.exit_score_threshold:
+        reasons.append("score_decay")
+    if pair not in targets:
+        reasons.append("not_in_targets")
+    return reasons
+
+
+def set_cooldown(state: SimBacktestState, pair: str, ts_ms: int, minutes: int) -> None:
+    state.cooldown_until[pair] = ts_ms + minutes * 60_000
+
+
+def in_cooldown(state: SimBacktestState, pair: str, ts_ms: int) -> bool:
+    return ts_ms < state.cooldown_until.get(pair, 0)
+
+
 def run_backtest(
     cfg: Config,
     market_data: Dict[str, pd.DataFrame],
@@ -454,7 +602,7 @@ def run_backtest(
 
     cash = initial_equity
     quantities: Dict[str, float] = {}
-    prev_risk_on = False
+    state = SimBacktestState(peak_equity=initial_equity, risk_on=False)
     equity_rows: List[Dict[str, float]] = []
     trade_rows: List[Dict[str, float]] = []
     rebalance_returns: List[float] = []
@@ -462,6 +610,7 @@ def run_backtest(
     running_peak_equity = initial_equity
 
     for step, ts in enumerate(common_index):
+        ts_ms = int(ts.timestamp() * 1000.0)
         current_prices: Dict[str, float] = {}
         for pair, symbol in pair_to_symbol.items():
             frame = market_data[symbol]
@@ -469,7 +618,7 @@ def run_backtest(
                 continue
             row = frame.loc[ts]
             entry = {
-                "ts": float(ts.timestamp() * 1000.0),
+                "ts": float(ts_ms),
                 "price": float(row["price"]),
                 "bid": float(row["bid"]),
                 "ask": float(row["ask"]),
@@ -482,168 +631,306 @@ def run_backtest(
         if not current_prices:
             continue
 
-        equity_before_rebalance = cash + sum(
-            quantity * current_prices[pair]
-            for pair, quantity in quantities.items()
-            if pair in current_prices
-        )
+        equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
+        state.peak_equity = max(state.peak_equity, equity_before_rebalance)
+        sync_position_meta(state, quantities, current_prices, ts_ms)
 
         if step > 0 and step % rebalance_minutes == 0:
+            skip_trim_pairs: set[str] = set()
+            drawdown = 1.0 - (equity_before_rebalance / state.peak_equity) if state.peak_equity > 0 else 0.0
+            if drawdown >= cfg.max_portfolio_drawdown:
+                for pair, quantity in list(quantities.items()):
+                    price = current_prices.get(pair, 0.0)
+                    if quantity <= 0 or price <= 0:
+                        continue
+                    sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, 0.50)
+                    if sell_quantity <= 0:
+                        continue
+                    notional = sell_quantity * price
+                    fee_paid = notional * fee_rate
+                    cash += notional - fee_paid
+                    remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
+                    if remaining_quantity > quantity * 1e-6:
+                        quantities[pair] = remaining_quantity
+                        meta = state.positions_meta.get(pair)
+                        if meta:
+                            meta.quantity = remaining_quantity
+                    else:
+                        quantities.pop(pair, None)
+                        state.positions_meta.pop(pair, None)
+                        set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
+                    skip_trim_pairs.add(pair)
+                    trade_score = score_trade_point(
+                        equity_value=mark_to_market_equity(cash, quantities, current_prices),
+                        initial_equity=initial_equity,
+                        running_peak=max(running_peak_equity, state.peak_equity),
+                        signal_weight=0.0,
+                        risk_on=state.risk_on,
+                        market_regime="risk_off",
+                    )
+                    trade_rows.append(
+                        {
+                            "ts": ts.isoformat(),
+                            "pair": pair,
+                            "symbol": pair_to_symbol[pair],
+                            "side": "SELL",
+                            "price": price,
+                            "quantity": sell_quantity,
+                            "notional": notional,
+                            "turnover": notional,
+                            "fee_paid": fee_paid,
+                            "target_weight": 0.0,
+                            "signal_score": -999.0,
+                            "reason": "portfolio_drawdown",
+                            "risk_on": int(bool(state.risk_on)),
+                            "market_regime": "risk_off",
+                            "signal_regime": "panic_exit",
+                            **trade_score,
+                        }
+                    )
+                sync_position_meta(state, quantities, current_prices, ts_ms)
+                equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
+                state.peak_equity = max(state.peak_equity, equity_before_rebalance)
+
             signals = strategy.generate_signals(
                 history=history,
                 trade_pairs=trade_pairs,
                 positions=quantities.copy(),
-                prev_risk_on=prev_risk_on,
+                prev_risk_on=state.risk_on,
             )
-            prev_risk_on = bool(signals["risk_on"])
+            state.risk_on = bool(signals["risk_on"])
             target_weights = signals["weights"]
+            features = signals["features"]
+            signal_regime = str(signals["regime"]["regime"])
+            market_regime = str(signals["portfolio_risk"]["market_regime"])
 
-            target_values: Dict[str, float] = {}
-            all_pairs = set(quantities) | set(target_weights)
-            for pair in all_pairs:
-                price = current_prices.get(pair)
-                if not price or price <= 0:
-                    continue
-                target_value = equity_before_rebalance * target_weights.get(pair, 0.0)
-                target_values[pair] = target_value
-
-            candidate_trades: List[Dict[str, float | str]] = []
-            for pair in all_pairs:
-                price = current_prices.get(pair)
-                if not price or price <= 0:
-                    continue
-                current_value = quantities.get(pair, 0.0) * price
-                target_value = target_values.get(pair, 0.0)
-                delta_value = target_value - current_value
-                if abs(delta_value) < 1e-8:
-                    continue
-                candidate_trades.append(
-                    {
-                        "pair": pair,
-                        "price": price,
-                        "current_value": current_value,
-                        "target_value": target_value,
-                        "delta_value": delta_value,
-                    }
-                )
-
-            sell_candidates = [item for item in candidate_trades if float(item["delta_value"]) < 0]
-            buy_candidates = [item for item in candidate_trades if float(item["delta_value"]) > 0]
-            ordered = sorted(
-                sell_candidates,
-                key=lambda item: abs(float(item["delta_value"])),
-                reverse=True,
-            ) + sorted(
-                buy_candidates,
-                key=lambda item: abs(float(item["delta_value"])),
-                reverse=True,
-            )
-
-            executed_notional = 0.0
-            executed_fee = 0.0
-            executed_pair = None
-            executed_side = None
-            executed_quantity = 0.0
-            executed_target_weight = 0.0
-            for candidate in ordered:
-                pair = str(candidate["pair"])
-                price = float(candidate["price"])
-                delta_value = float(candidate["delta_value"])
-                current_value = float(candidate["current_value"])
-
-                if delta_value < 0:
-                    sell_value = min(abs(delta_value), current_value)
-                    if sell_value <= 0:
+            if features:
+                for pair, quantity in list(quantities.items()):
+                    price = current_prices.get(pair, 0.0)
+                    if price <= 0:
                         continue
-                    sell_quantity = min(quantities.get(pair, 0.0), sell_value / price)
+                    score = features.get(pair, {}).get("score", -999.0)
+                    meta = build_position_meta(state, pair, quantity, price, score, ts_ms)
+                    reasons = exit_reasons(cfg, pair, meta, price, score, target_weights)
+                    if reasons:
+                        if "stop_loss" in reasons or "trailing_stop" in reasons:
+                            sell_fraction = 1.0
+                        elif "not_in_targets" in reasons:
+                            sell_fraction = 0.50
+                        else:
+                            sell_fraction = 0.35
+                        sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, sell_fraction)
+                        if sell_quantity <= 0:
+                            state.positions_meta[pair] = meta
+                            continue
+                        notional = sell_quantity * price
+                        fee_paid = notional * fee_rate
+                        cash += notional - fee_paid
+                        remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
+                        if remaining_quantity > quantity * 1e-6:
+                            quantities[pair] = remaining_quantity
+                            meta.quantity = remaining_quantity
+                            state.positions_meta[pair] = meta
+                            if sell_fraction < 1.0:
+                                skip_trim_pairs.add(pair)
+                        else:
+                            quantities.pop(pair, None)
+                            state.positions_meta.pop(pair, None)
+                            set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
+                        post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                        trade_score = score_trade_point(
+                            equity_value=post_trade_equity,
+                            initial_equity=initial_equity,
+                            running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                            signal_weight=0.0,
+                            risk_on=bool(signals["risk_on"]),
+                            market_regime=market_regime,
+                        )
+                        trade_rows.append(
+                            {
+                                "ts": ts.isoformat(),
+                                "pair": pair,
+                                "symbol": pair_to_symbol[pair],
+                                "side": "SELL",
+                                "price": price,
+                                "quantity": sell_quantity,
+                                "notional": notional,
+                                "turnover": notional,
+                                "fee_paid": fee_paid,
+                                "target_weight": target_weights.get(pair, 0.0),
+                                "signal_score": score,
+                                "reason": "+".join(reasons),
+                                "risk_on": int(bool(signals["risk_on"])),
+                                "market_regime": market_regime,
+                                "signal_regime": signal_regime,
+                                **trade_score,
+                            }
+                        )
+                    else:
+                        state.positions_meta[pair] = meta
+
+                portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
+                notional_map = current_notional(quantities, current_prices)
+                threshold = rebalance_notional_threshold(cfg, portfolio_equity)
+                for pair, quantity in list(quantities.items()):
+                    if pair in skip_trim_pairs:
+                        continue
+                    price = current_prices.get(pair, 0.0)
+                    if price <= 0:
+                        continue
+                    target_usd = portfolio_equity * target_weights.get(pair, 0.0)
+                    current_usd = notional_map.get(pair, 0.0)
+                    trim_usd = current_usd - target_usd
+                    if trim_usd < threshold:
+                        continue
+                    sell_quantity = quantity if target_usd <= 0 else quantity_for_notional(cfg, trade_pairs, pair, trim_usd, price)
                     if sell_quantity <= 0:
                         continue
-                    executed_notional = sell_quantity * price
-                    executed_fee = executed_notional * fee_rate
-                    cash += executed_notional - executed_fee
+                    score = features.get(pair, {}).get("score", -999.0)
+                    reason = "target_exit_retry" if target_usd <= 0 else "target_trim"
+                    notional = sell_quantity * price
+                    fee_paid = notional * fee_rate
+                    cash += notional - fee_paid
                     remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
-                    if remaining_quantity > 1e-12:
+                    if remaining_quantity > quantity * 1e-6:
                         quantities[pair] = remaining_quantity
+                        meta = state.positions_meta.get(pair)
+                        if meta:
+                            meta.quantity = remaining_quantity
                     else:
                         quantities.pop(pair, None)
-                    executed_pair = pair
-                    executed_side = "SELL"
-                    executed_quantity = sell_quantity
-                    executed_target_weight = target_weights.get(pair, 0.0)
-                    break
+                        state.positions_meta.pop(pair, None)
+                        if target_usd <= 0:
+                            set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
+                    post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                    trade_score = score_trade_point(
+                        equity_value=post_trade_equity,
+                        initial_equity=initial_equity,
+                        running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                        signal_weight=target_weights.get(pair, 0.0),
+                        risk_on=bool(signals["risk_on"]),
+                        market_regime=market_regime,
+                    )
+                    trade_rows.append(
+                        {
+                            "ts": ts.isoformat(),
+                            "pair": pair,
+                            "symbol": pair_to_symbol[pair],
+                            "side": "SELL",
+                            "price": price,
+                            "quantity": sell_quantity,
+                            "notional": notional,
+                            "turnover": notional,
+                            "fee_paid": fee_paid,
+                            "target_weight": target_weights.get(pair, 0.0),
+                            "signal_score": score,
+                            "reason": reason,
+                            "risk_on": int(bool(signals["risk_on"])),
+                            "market_regime": market_regime,
+                            "signal_regime": signal_regime,
+                            **trade_score,
+                        }
+                    )
 
-                affordable_value = cash / (1.0 + fee_rate) if fee_rate >= 0 else cash
-                buy_value = min(delta_value, max(affordable_value, 0.0))
-                if buy_value <= 0:
-                    continue
-                buy_quantity = buy_value / price
-                if buy_quantity <= 0:
-                    continue
-                executed_notional = buy_quantity * price
-                executed_fee = executed_notional * fee_rate
-                cash -= executed_notional + executed_fee
-                quantities[pair] = quantities.get(pair, 0.0) + buy_quantity
-                executed_pair = pair
-                executed_side = "BUY"
-                executed_quantity = buy_quantity
-                executed_target_weight = target_weights.get(pair, 0.0)
-                break
+                portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
+                usd_free = cash
+                threshold = rebalance_notional_threshold(cfg, portfolio_equity)
+                notional_map = current_notional(quantities, current_prices)
+                for pair, weight in sorted(target_weights.items(), key=lambda item: item[1], reverse=True):
+                    if in_cooldown(state, pair, ts_ms):
+                        continue
+                    price = current_prices.get(pair, 0.0)
+                    if price <= 0 or pair not in features:
+                        continue
+                    target_usd = portfolio_equity * weight
+                    current_usd = notional_map.get(pair, 0.0)
+                    diff_usd = target_usd - current_usd
+                    if diff_usd < threshold:
+                        continue
+                    usable_cash = max(0.0, usd_free - portfolio_equity * cfg.cash_buffer)
+                    if usable_cash <= 0:
+                        continue
+                    buy_usd = min(diff_usd, usable_cash)
+                    buy_quantity = quantity_for_notional(cfg, trade_pairs, pair, buy_usd, price)
+                    if buy_quantity <= 0:
+                        continue
+                    notional = buy_quantity * price
+                    fee_paid = notional * fee_rate
+                    total_cost = notional + fee_paid
+                    if total_cost > cash + 1e-9:
+                        continue
+                    cash -= total_cost
+                    quantities[pair] = quantities.get(pair, 0.0) + buy_quantity
+                    score = features[pair]["score"]
+                    meta = state.positions_meta.get(pair)
+                    if meta is None:
+                        state.positions_meta[pair] = SimPositionMeta(
+                            pair=pair,
+                            quantity=buy_quantity,
+                            entry_price=price,
+                            highest_price=price,
+                            last_trade_ts=ts_ms,
+                            last_signal_score=score,
+                            last_reason="target_rebalance",
+                        )
+                    else:
+                        previous_quantity = meta.quantity
+                        new_quantity = previous_quantity + buy_quantity
+                        if new_quantity > 0:
+                            meta.entry_price = ((meta.entry_price * previous_quantity) + (price * buy_quantity)) / new_quantity
+                        meta.quantity = new_quantity
+                        meta.highest_price = max(meta.highest_price, price)
+                        meta.last_trade_ts = ts_ms
+                        meta.last_signal_score = score
+                        meta.last_reason = "target_rebalance"
+                    usd_free -= notional
+                    notional_map[pair] = quantities[pair] * price
+                    post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                    trade_score = score_trade_point(
+                        equity_value=post_trade_equity,
+                        initial_equity=initial_equity,
+                        running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                        signal_weight=weight,
+                        risk_on=bool(signals["risk_on"]),
+                        market_regime=market_regime,
+                    )
+                    trade_rows.append(
+                        {
+                            "ts": ts.isoformat(),
+                            "pair": pair,
+                            "symbol": pair_to_symbol[pair],
+                            "side": "BUY",
+                            "price": price,
+                            "quantity": buy_quantity,
+                            "notional": notional,
+                            "turnover": notional,
+                            "fee_paid": fee_paid,
+                            "target_weight": weight,
+                            "signal_score": score,
+                            "reason": "target_rebalance",
+                            "risk_on": int(bool(signals["risk_on"])),
+                            "market_regime": market_regime,
+                            "signal_regime": signal_regime,
+                            **trade_score,
+                        }
+                    )
 
-            post_trade_equity = cash + sum(
-                quantity * current_prices[pair]
-                for pair, quantity in quantities.items()
-                if pair in current_prices
-            )
-            if executed_pair is not None:
-                trade_score = score_trade_point(
-                    equity_value=post_trade_equity,
-                    initial_equity=initial_equity,
-                    running_peak=max(running_peak_equity, post_trade_equity),
-                    signal_weight=executed_target_weight,
-                    risk_on=bool(signals["risk_on"]),
-                    market_regime=str(signals["portfolio_risk"]["market_regime"]),
-                )
-                trade_rows.append(
-                    {
-                        "ts": ts.isoformat(),
-                        "pair": executed_pair,
-                        "symbol": pair_to_symbol[executed_pair],
-                        "side": executed_side,
-                        "price": current_prices[executed_pair],
-                        "quantity": executed_quantity,
-                        "notional": executed_notional,
-                        "turnover": executed_notional,
-                        "fee_paid": executed_fee,
-                        "target_weight": executed_target_weight,
-                        "risk_on": int(bool(signals["risk_on"])),
-                        "market_regime": signals["portfolio_risk"]["market_regime"],
-                        "signal_regime": signals["regime"]["regime"],
-                        **trade_score,
-                    }
-                )
-                running_peak_equity = max(running_peak_equity, post_trade_equity)
-
+            sync_position_meta(state, quantities, current_prices, ts_ms)
+            post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+            state.peak_equity = max(state.peak_equity, post_trade_equity)
             if last_rebalance_equity > 0:
                 rebalance_returns.append(post_trade_equity / last_rebalance_equity - 1.0)
             last_rebalance_equity = post_trade_equity
             equity_before_rebalance = post_trade_equity
 
-        marked_equity = cash + sum(
-            quantity * current_prices[pair]
-            for pair, quantity in quantities.items()
-            if pair in current_prices
-        )
+        marked_equity = mark_to_market_equity(cash, quantities, current_prices)
         running_peak_equity = max(running_peak_equity, marked_equity)
         equity_rows.append(
             {
                 "ts": ts.isoformat(),
                 "equity": marked_equity,
                 "cash": cash,
-                "gross_exposure": sum(
-                    quantity * current_prices[pair]
-                    for pair, quantity in quantities.items()
-                    if pair in current_prices
-                ) / marked_equity if marked_equity > 0 else 0.0,
+                "gross_exposure": sum(current_notional(quantities, current_prices).values()) / marked_equity if marked_equity > 0 else 0.0,
                 "positions": len(quantities),
             }
         )
@@ -739,6 +1026,8 @@ def main() -> None:
     )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_dir / f"run_{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
     summary = summarize_run(
         symbols=list(available_pair_to_symbol.values()),
         roostoo_pairs=list(available_pair_to_symbol.keys()),
@@ -748,9 +1037,9 @@ def main() -> None:
         metrics=metrics,
         scorecard=scorecard,
     )
-    summary_path = output_dir / f"summary_{stamp}.csv"
-    equity_path = output_dir / f"equity_curve_{stamp}.csv"
-    trades_path = output_dir / f"trades_{stamp}.csv"
+    summary_path = run_dir / f"summary_{stamp}.csv"
+    equity_path = run_dir / f"equity_curve_{stamp}.csv"
+    trades_path = run_dir / f"trades_{stamp}.csv"
 
     summary.to_csv(summary_path, index=False)
     equity_curve.to_csv(equity_path, index=False)
@@ -775,7 +1064,7 @@ def main() -> None:
     print(f"Trades CSV: {trades_path}")
     print()
     print("Note: this backtest now aligns the universe and initial wallet to Roostoo exchangeInfo,")
-    print("maps Roostoo /USD pairs to Binance USDT spot aggTrades, and enforces max 1 trade every 30 minutes by default.")
+    print("maps Roostoo /USD pairs to Binance USDT spot aggTrades, and enforces max 1 rebalance every 10 minutes by default.")
 
 
 if __name__ == "__main__":

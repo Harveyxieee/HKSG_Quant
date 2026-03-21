@@ -445,6 +445,10 @@ class MomentumStrategy:
     def __init__(self, cfg: Any):
         self.cfg = cfg
         self.regime_filter = None
+        self.rank_retention_buffer = 0.18
+        self.pump_chase_cutoff = 0.035
+        self.pullback_entry_floor = -0.025
+        self.holding_bonus_floor = 0.22
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -480,6 +484,26 @@ class MomentumStrategy:
             for pair in capped_pairs:
                 pending.pop(pair, None)
         return {pair: weight for pair, weight in weights.items() if weight > 0}
+
+    def exposure_multiplier(self, regime_name: str, snapshot: MarketSnapshot) -> float:
+        multiplier = {
+            "trend": 0.90,
+            "neutral": 0.45,
+            "range": 0.0,
+            "panic": 0.0,
+        }.get(regime_name, 0.35)
+
+        breadth = snapshot.positive_score_ratio
+        if breadth >= 0.60:
+            multiplier *= 1.0
+        elif breadth >= 0.50:
+            multiplier *= 0.85
+        else:
+            multiplier *= 0.65
+
+        if snapshot.median_ret60 <= 0:
+            multiplier *= 0.75
+        return clamp(multiplier, 0.0, 1.0)
 
     def compute_features(
         self,
@@ -563,12 +587,16 @@ class MomentumStrategy:
             )
             if feature["dist_ma20"] > self.cfg.max_pump_distance:
                 score -= 0.20 + 2.5 * (feature["dist_ma20"] - self.cfg.max_pump_distance)
+            if feature["ret5"] > 0.05 and feature["dist_ma20"] > self.pump_chase_cutoff:
+                score -= 0.18 + 1.8 * (feature["dist_ma20"] - self.pump_chase_cutoff)
             if feature["spread"] > self.cfg.spread_threshold * 0.7:
                 score -= 0.15 * (feature["spread"] / max(self.cfg.spread_threshold, 1e-9))
             if feature["ret5"] < 0 and feature["pullback20"] < -0.03:
                 score -= 0.12
             if feature["ret60"] < 0 and feature["ret5"] > 0.02:
                 score -= 0.10
+            if feature["range_position20"] > 0.92 and feature["ret15"] > 0.03:
+                score -= 0.08
             feature["score"] = score
         return {pair: features[pair] for pair in eligible_pairs}
 
@@ -613,10 +641,30 @@ class MomentumStrategy:
             threshold = self.cfg.exit_score_threshold if pair in held_pairs else self.cfg.entry_score_threshold
             if feature["score"] < threshold:
                 continue
+            if pair not in held_pairs:
+                if feature["dist_ma20"] > self.pump_chase_cutoff:
+                    continue
+                if feature["pullback20"] < self.pullback_entry_floor:
+                    continue
             ranking_score = feature["score"] + (self.cfg.holding_score_bonus if pair in held_pairs else 0.0)
+            if pair in held_pairs:
+                ranking_score += max(self.cfg.holding_score_bonus, self.holding_bonus_floor)
             ranked.append((pair, feature, ranking_score, threshold))
         ranked.sort(key=lambda item: (item[2], item[1]["trend_ratio60"], item[1]["ret15"]), reverse=True)
-        ranked = ranked[: self.cfg.top_n]
+        if len(ranked) > self.cfg.top_n:
+            cutoff_score = ranked[self.cfg.top_n - 1][2]
+            retained: List[Tuple[str, Dict[str, float], float, float]] = []
+            for item in ranked:
+                pair, feature, ranking_score, _threshold = item
+                if len(retained) < self.cfg.top_n:
+                    retained.append(item)
+                    continue
+                if pair not in held_pairs:
+                    continue
+                if ranking_score + self.rank_retention_buffer < cutoff_score:
+                    continue
+                retained.append(item)
+            ranked = retained
         if not ranked:
             return {}
         strengths: List[Tuple[str, float]] = []
@@ -740,7 +788,8 @@ class MomentumStrategy:
 
         features = self.compute_features(history, trade_pairs)
         snapshot = self.market_snapshot(features)
-        base_risk_on = regime["regime"] in ["trend", "neutral"]
+        snapshot_risk_on = self.risk_on(snapshot, prev_risk_on)
+        base_risk_on = regime["regime"] in ["trend", "neutral"] and snapshot_risk_on
         raw_weights = self.target_weights(features, base_risk_on, positions)
 
         regime_name = regime["regime"]
@@ -753,14 +802,7 @@ class MomentumStrategy:
                 }
 
         if raw_weights:
-            if regime_name == "range":
-                multiplier = 1.0
-            elif regime_name == "neutral":
-                multiplier = 0.6
-            elif regime_name == "trend":
-                multiplier = 1.0
-            else:
-                multiplier = 0.0
+            multiplier = self.exposure_multiplier(regime_name, snapshot)
             total = sum(raw_weights.values())
             if total > 0:
                 raw_weights = {
