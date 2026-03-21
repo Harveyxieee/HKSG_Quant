@@ -596,6 +596,17 @@ class RoostooMomentumBot:
             return 0.0
         return quantity
 
+    def quantity_for_fraction(self, pair: str, quantity: float, price: float, fraction: float) -> float:
+        if quantity <= 0 or price <= 0:
+            return 0.0
+        fraction = max(0.0, min(1.0, fraction))
+        if fraction <= 0:
+            return 0.0
+        if fraction >= 1.0:
+            return quantity
+        notional_usd = quantity * price * fraction
+        return min(quantity, self.quantity_for_notional(pair, notional_usd, price))
+
     def log_trade(
         self,
         pair: str,
@@ -763,7 +774,14 @@ class RoostooMomentumBot:
             reasons.append("not_in_targets")
         return reasons
 
-    def manage_existing_positions(self, positions: Dict[str, float], tickers: Dict[str, Any], features: Dict[str, Dict[str, float]], targets: Dict[str, float]) -> None:
+    def manage_existing_positions(
+        self,
+        positions: Dict[str, float],
+        tickers: Dict[str, Any],
+        features: Dict[str, Dict[str, float]],
+        targets: Dict[str, float],
+    ) -> set[str]:
+        skip_trim_pairs: set[str] = set()
         for pair, quantity in list(positions.items()):
             price = self.pair_price(pair, tickers)
             if price <= 0:
@@ -772,11 +790,27 @@ class RoostooMomentumBot:
             meta = self.build_position_meta(pair, quantity, price, score)
             reasons = self.exit_reasons(pair, meta, price, score, targets)
             if reasons:
-                if self.submit_market_order(pair, "SELL", quantity, "+".join(reasons), score, price):
-                    self.remove_position_meta(pair)
-                    self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                if "stop_loss" in reasons or "trailing_stop" in reasons:
+                    sell_fraction = 1.0
+                elif "not_in_targets" in reasons:
+                    sell_fraction = 0.50
+                else:
+                    sell_fraction = 0.35
+                sell_quantity = self.quantity_for_fraction(pair, quantity, price, sell_fraction)
+                if sell_quantity <= 0:
+                    self.set_position_meta(meta)
+                    continue
+                if self.submit_market_order(pair, "SELL", sell_quantity, "+".join(reasons), score, price):
+                    if sell_quantity >= quantity * 0.999999:
+                        self.remove_position_meta(pair)
+                        self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                    else:
+                        meta.quantity = max(quantity - sell_quantity, 0.0)
+                        self.set_position_meta(meta)
+                        skip_trim_pairs.add(pair)
                 continue
             self.set_position_meta(meta)
+        return skip_trim_pairs
 
     def trim_positions(
         self,
@@ -785,8 +819,11 @@ class RoostooMomentumBot:
         features: Dict[str, Dict[str, float]],
         targets: Dict[str, float],
         rebalance_threshold: float,
+        skip_pairs: Optional[set[str]] = None,
     ) -> None:
         for pair, quantity in list(portfolio.positions.items()):
+            if skip_pairs and pair in skip_pairs:
+                continue
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
@@ -872,6 +909,33 @@ class RoostooMomentumBot:
             self.remove_position_meta(pair)
             self.set_cooldown(pair, self.cfg.cooldown_minutes)
 
+    def reduce_all_positions(
+        self,
+        positions: Dict[str, float],
+        tickers: Dict[str, Any],
+        reason: str,
+        fraction: float,
+    ) -> set[str]:
+        reduced_pairs: set[str] = set()
+        for pair, quantity in positions.items():
+            if quantity <= 0:
+                continue
+            price = self.pair_price(pair, tickers)
+            sell_quantity = self.quantity_for_fraction(pair, quantity, price, fraction)
+            if sell_quantity <= 0:
+                continue
+            if self.submit_market_order(pair, "SELL", sell_quantity, reason, -999.0, price):
+                if sell_quantity >= quantity * 0.999999:
+                    self.remove_position_meta(pair)
+                    self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                else:
+                    meta = self.position_meta(pair)
+                    if meta is not None:
+                        meta.quantity = max(quantity - sell_quantity, 0.0)
+                        self.set_position_meta(meta)
+                    reduced_pairs.add(pair)
+        return reduced_pairs
+
     def rebalance_once(self) -> None:
         now = time.time()
 
@@ -886,12 +950,17 @@ class RoostooMomentumBot:
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.capture_portfolio_state(portfolio, tickers)
+        skip_trim_pairs: set[str] = set()
         if portfolio.drawdown >= self.cfg.max_portfolio_drawdown:
             logger.warning("Portfolio kill switch triggered.")
-            self.exit_all_positions(portfolio.positions, tickers, "portfolio_drawdown")
-            self.persist_runtime_state()
-            self.last_rebalance_ts = now
-            return
+            skip_trim_pairs = self.reduce_all_positions(
+                portfolio.positions,
+                tickers,
+                "portfolio_drawdown",
+                0.50,
+            )
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.sync_position_meta(portfolio.positions, tickers)
 
         signals = self.strategy.generate_signals(
             history=self.history,
@@ -914,12 +983,21 @@ class RoostooMomentumBot:
             self.last_rebalance_ts = now
             return
 
-        self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
+        skip_trim_pairs.update(
+            self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
+        )
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)
         rebalance_threshold = self.rebalance_notional_threshold(portfolio.equity)
-        self.trim_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
+        self.trim_positions(
+            portfolio,
+            tickers,
+            signals["features"],
+            signals["weights"],
+            rebalance_threshold,
+            skip_pairs=skip_trim_pairs,
+        )
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)

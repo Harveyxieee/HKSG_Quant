@@ -295,8 +295,12 @@ def load_symbol_minute_bars(symbol: str, start_date: date, end_date: date, cache
     minute = minute.dropna(subset=["price"])
     minute["change_24h"] = minute["price"].pct_change(24 * 60).fillna(0.0)
     minute["unit_trade_value"] = minute["quote_value"].rolling(24 * 60, min_periods=1).sum()
-    minute["bid"] = minute["price"]
-    minute["ask"] = minute["price"]
+    avg_minute_quote = (minute["unit_trade_value"] / (24 * 60)).clip(lower=1.0)
+    realized_quote = minute["quote_value"].clip(lower=avg_minute_quote * 0.05)
+    liquidity_pressure = (avg_minute_quote / realized_quote).pow(0.5).clip(lower=1.0, upper=6.0)
+    spread = (0.0006 * liquidity_pressure).clip(lower=0.0006, upper=0.0040)
+    minute["bid"] = minute["price"] * (1.0 - spread / 2.0)
+    minute["ask"] = minute["price"] * (1.0 + spread / 2.0)
     return minute[["price", "quote_value", "change_24h", "bid", "ask", "unit_trade_value"]]
 
 
@@ -548,6 +552,28 @@ def quantity_for_fraction(
     return min(quantity, quantity_for_notional(cfg, trade_pairs, pair, quantity * price * fraction, price))
 
 
+def execution_price(side: str, market_row: Dict[str, float], quantity: float, reference_price: float) -> float:
+    if quantity <= 0:
+        return 0.0
+    mid = float(market_row.get("price", reference_price))
+    bid = float(market_row.get("bid", mid))
+    ask = float(market_row.get("ask", mid))
+    base_price = ask if side == "BUY" else bid
+    if base_price <= 0:
+        return 0.0
+
+    notional = max(quantity * max(reference_price, 0.0), quantity * base_price)
+    minute_liquidity = float(market_row.get("quote_value", 0.0))
+    daily_liquidity = float(market_row.get("unit_trade_value", 0.0))
+    fallback_liquidity = max(daily_liquidity / (24 * 60) * 0.25, 1.0)
+    effective_liquidity = max(minute_liquidity, fallback_liquidity)
+    participation = notional / effective_liquidity if effective_liquidity > 0 else 1.0
+    impact = clamp(math.sqrt(max(participation, 0.0)) * 0.0005, 0.0, 0.0030)
+    if side == "BUY":
+        return base_price * (1.0 + impact)
+    return max(base_price * (1.0 - impact), 1e-12)
+
+
 def build_position_meta(state: SimBacktestState, pair: str, quantity: float, price: float, score: float, ts_ms: int) -> SimPositionMeta:
     meta = state.positions_meta.get(pair)
     if meta is None:
@@ -612,6 +638,7 @@ def run_backtest(
     for step, ts in enumerate(common_index):
         ts_ms = int(ts.timestamp() * 1000.0)
         current_prices: Dict[str, float] = {}
+        current_market: Dict[str, Dict[str, float]] = {}
         for pair, symbol in pair_to_symbol.items():
             frame = market_data[symbol]
             if ts not in frame.index:
@@ -627,6 +654,7 @@ def run_backtest(
             }
             history[pair].append(entry)
             current_prices[pair] = float(row["price"])
+            current_market[pair] = entry
 
         if not current_prices:
             continue
@@ -641,12 +669,16 @@ def run_backtest(
             if drawdown >= cfg.max_portfolio_drawdown:
                 for pair, quantity in list(quantities.items()):
                     price = current_prices.get(pair, 0.0)
+                    market_row = current_market.get(pair)
                     if quantity <= 0 or price <= 0:
                         continue
                     sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, 0.50)
                     if sell_quantity <= 0:
                         continue
-                    notional = sell_quantity * price
+                    if market_row is None:
+                        continue
+                    executed_price = execution_price("SELL", market_row, sell_quantity, price)
+                    notional = sell_quantity * executed_price
                     fee_paid = notional * fee_rate
                     cash += notional - fee_paid
                     remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
@@ -674,7 +706,7 @@ def run_backtest(
                             "pair": pair,
                             "symbol": pair_to_symbol[pair],
                             "side": "SELL",
-                            "price": price,
+                            "price": executed_price,
                             "quantity": sell_quantity,
                             "notional": notional,
                             "turnover": notional,
@@ -690,7 +722,6 @@ def run_backtest(
                     )
                 sync_position_meta(state, quantities, current_prices, ts_ms)
                 equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
-                state.peak_equity = max(state.peak_equity, equity_before_rebalance)
 
             signals = strategy.generate_signals(
                 history=history,
@@ -707,6 +738,7 @@ def run_backtest(
             if features:
                 for pair, quantity in list(quantities.items()):
                     price = current_prices.get(pair, 0.0)
+                    market_row = current_market.get(pair)
                     if price <= 0:
                         continue
                     score = features.get(pair, {}).get("score", -999.0)
@@ -723,7 +755,11 @@ def run_backtest(
                         if sell_quantity <= 0:
                             state.positions_meta[pair] = meta
                             continue
-                        notional = sell_quantity * price
+                        if market_row is None:
+                            state.positions_meta[pair] = meta
+                            continue
+                        executed_price = execution_price("SELL", market_row, sell_quantity, price)
+                        notional = sell_quantity * executed_price
                         fee_paid = notional * fee_rate
                         cash += notional - fee_paid
                         remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
@@ -752,7 +788,7 @@ def run_backtest(
                                 "pair": pair,
                                 "symbol": pair_to_symbol[pair],
                                 "side": "SELL",
-                                "price": price,
+                                "price": executed_price,
                                 "quantity": sell_quantity,
                                 "notional": notional,
                                 "turnover": notional,
@@ -776,6 +812,7 @@ def run_backtest(
                     if pair in skip_trim_pairs:
                         continue
                     price = current_prices.get(pair, 0.0)
+                    market_row = current_market.get(pair)
                     if price <= 0:
                         continue
                     target_usd = portfolio_equity * target_weights.get(pair, 0.0)
@@ -786,9 +823,12 @@ def run_backtest(
                     sell_quantity = quantity if target_usd <= 0 else quantity_for_notional(cfg, trade_pairs, pair, trim_usd, price)
                     if sell_quantity <= 0:
                         continue
+                    if market_row is None:
+                        continue
                     score = features.get(pair, {}).get("score", -999.0)
                     reason = "target_exit_retry" if target_usd <= 0 else "target_trim"
-                    notional = sell_quantity * price
+                    executed_price = execution_price("SELL", market_row, sell_quantity, price)
+                    notional = sell_quantity * executed_price
                     fee_paid = notional * fee_rate
                     cash += notional - fee_paid
                     remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
@@ -817,7 +857,7 @@ def run_backtest(
                             "pair": pair,
                             "symbol": pair_to_symbol[pair],
                             "side": "SELL",
-                            "price": price,
+                            "price": executed_price,
                             "quantity": sell_quantity,
                             "notional": notional,
                             "turnover": notional,
@@ -840,6 +880,7 @@ def run_backtest(
                     if in_cooldown(state, pair, ts_ms):
                         continue
                     price = current_prices.get(pair, 0.0)
+                    market_row = current_market.get(pair)
                     if price <= 0 or pair not in features:
                         continue
                     target_usd = portfolio_equity * weight
@@ -854,7 +895,10 @@ def run_backtest(
                     buy_quantity = quantity_for_notional(cfg, trade_pairs, pair, buy_usd, price)
                     if buy_quantity <= 0:
                         continue
-                    notional = buy_quantity * price
+                    if market_row is None:
+                        continue
+                    executed_price = execution_price("BUY", market_row, buy_quantity, price)
+                    notional = buy_quantity * executed_price
                     fee_paid = notional * fee_rate
                     total_cost = notional + fee_paid
                     if total_cost > cash + 1e-9:
@@ -867,8 +911,8 @@ def run_backtest(
                         state.positions_meta[pair] = SimPositionMeta(
                             pair=pair,
                             quantity=buy_quantity,
-                            entry_price=price,
-                            highest_price=price,
+                            entry_price=executed_price,
+                            highest_price=executed_price,
                             last_trade_ts=ts_ms,
                             last_signal_score=score,
                             last_reason="target_rebalance",
@@ -877,9 +921,9 @@ def run_backtest(
                         previous_quantity = meta.quantity
                         new_quantity = previous_quantity + buy_quantity
                         if new_quantity > 0:
-                            meta.entry_price = ((meta.entry_price * previous_quantity) + (price * buy_quantity)) / new_quantity
+                            meta.entry_price = ((meta.entry_price * previous_quantity) + (executed_price * buy_quantity)) / new_quantity
                         meta.quantity = new_quantity
-                        meta.highest_price = max(meta.highest_price, price)
+                        meta.highest_price = max(meta.highest_price, executed_price)
                         meta.last_trade_ts = ts_ms
                         meta.last_signal_score = score
                         meta.last_reason = "target_rebalance"
@@ -900,7 +944,7 @@ def run_backtest(
                             "pair": pair,
                             "symbol": pair_to_symbol[pair],
                             "side": "BUY",
-                            "price": price,
+                            "price": executed_price,
                             "quantity": buy_quantity,
                             "notional": notional,
                             "turnover": notional,
@@ -917,7 +961,6 @@ def run_backtest(
 
             sync_position_meta(state, quantities, current_prices, ts_ms)
             post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
-            state.peak_equity = max(state.peak_equity, post_trade_equity)
             if last_rebalance_equity > 0:
                 rebalance_returns.append(post_trade_equity / last_rebalance_equity - 1.0)
             last_rebalance_equity = post_trade_equity
