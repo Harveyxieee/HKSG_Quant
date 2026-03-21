@@ -626,6 +626,15 @@ class MomentumStrategy:
             required=self.mu_model_required,
         )
 
+        # --- turnover reduction / less aggressive sell ---
+        self.rank_retention_buffer = 0.18
+        self.holding_bonus_floor = 0.22
+
+        # anti-chase for new entries
+        self.pump_chase_cutoff = 0.035
+        self.pullback_entry_floor = -0.025
+        self.range_keep_exposure = 0.30
+
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
             return 0.0
@@ -869,39 +878,114 @@ class MomentumStrategy:
             and snapshot.positive_score_ratio >= self.cfg.market_positive_score_ratio_threshold
         )
 
-    def target_weights(
+    def _select_ranked_with_retention(
         self,
-        features: FeatureMap,
-        risk_on: bool,
-        positions: Dict[str, float],
+        ranked: List[Tuple[str, Dict[str, float], float, float]],
+        held_pairs: set[str],
+    ) -> List[Tuple[str, Dict[str, float], float, float]]:
+        if not ranked:
+            return []
+
+        ranked.sort(
+            key=lambda item: (
+                item[2],
+                item[1].get("pred_mu", 0.0),
+                item[1]["trend_ratio60"],
+                item[1]["ret15"],
+            ),
+            reverse=True,
+        )
+
+        if len(ranked) <= self.cfg.top_n:
+            return ranked
+
+        selected = ranked[: self.cfg.top_n]
+        selected_pairs = {item[0] for item in selected}
+        cutoff_score = selected[-1][2]
+
+        for item in ranked[self.cfg.top_n:]:
+            pair, feature, ranking_score, threshold = item
+            if pair not in held_pairs:
+                continue
+            if pair in selected_pairs:
+                continue
+
+            # 已有持仓只要没明显掉出 cutoff，就允许保留
+            if ranking_score >= cutoff_score - self.rank_retention_buffer:
+                selected.append(item)
+                selected_pairs.add(pair)
+
+        return selected
+
+    def target_weights(
+            self,
+            features: FeatureMap,
+            risk_on: bool,
+            positions: Dict[str, float],
     ) -> Dict[str, float]:
         if not risk_on or not features:
             return {}
+
         held_pairs = set(positions)
         ranked: List[Tuple[str, Dict[str, float], float, float]] = []
+
         for pair, feature in features.items():
-            threshold = self.cfg.exit_score_threshold if pair in held_pairs else self.cfg.entry_score_threshold
-            if feature["score"] < threshold:
+            is_held = pair in held_pairs
+            threshold = self.cfg.exit_score_threshold if is_held else self.cfg.entry_score_threshold
+            score = feature["score"]
+
+            if score < threshold:
                 continue
-            ranking_score = feature["score"] + (self.cfg.holding_score_bonus if pair in held_pairs else 0.0)
+
+            # --- anti-chase for new entries only ---
+            if not is_held:
+                dist_ma20 = feature.get("dist_ma20", 0.0)
+                pullback20 = feature.get("pullback20", 0.0)
+                ret5 = feature.get("ret5", 0.0)
+                ret15 = feature.get("ret15", 0.0)
+
+                # 涨太快、离均线太远：不追
+                if dist_ma20 > self.pump_chase_cutoff:
+                    continue
+                if ret5 > self.pump_chase_cutoff or ret15 > self.pump_chase_cutoff * 1.5:
+                    continue
+
+                # 回撤太深也不接
+                if pullback20 < self.pullback_entry_floor:
+                    continue
+
+            # --- holding retention bonus ---
+            holding_bonus = 0.0
+            if is_held:
+                holding_bonus = max(self.cfg.holding_score_bonus, self.holding_bonus_floor)
+
+            ranking_score = score + holding_bonus
+
+            # 对新仓再加一点“别追涨”的软惩罚，而不是只靠硬过滤
+            if not is_held:
+                if feature.get("dist_ma20", 0.0) > self.pump_chase_cutoff * 0.6:
+                    ranking_score -= 0.12
+                if feature.get("ret5", 0.0) > self.pump_chase_cutoff * 0.6:
+                    ranking_score -= 0.10
+                if feature.get("range_position20", 0.5) > 0.92:
+                    ranking_score -= 0.08
+
             ranked.append((pair, feature, ranking_score, threshold))
 
-        ranked.sort(
-            key=lambda item: (item[2], item[1].get("pred_mu", 0.0), item[1]["trend_ratio60"], item[1]["ret15"]),
-            reverse=True,
-        )
-        ranked = ranked[: self.cfg.top_n]
+        ranked = self._select_ranked_with_retention(ranked, held_pairs)
         if not ranked:
             return {}
 
         strengths: List[Tuple[str, float]] = []
         for pair, feature, ranking_score, threshold in ranked:
             vol = clamp(feature["vol60"], self.cfg.vol_floor, self.cfg.vol_cap)
+
             liquidity_multiplier = clamp(
                 math.log1p(feature["unit_trade_value"] / max(self.cfg.min_24h_dollar_vol, 1.0)),
                 0.75,
                 1.35,
             )
+
             quality_multiplier = clamp(
                 1.0
                 + max(feature["trend_ratio60"], 0.0) * 0.08
@@ -910,31 +994,73 @@ class MomentumStrategy:
                 0.80,
                 1.55,
             )
+
+            # 已持仓再给一点强度保护，减少被 trim / replace
+            if pair in held_pairs:
+                quality_multiplier *= 1.08
+
             edge = max(ranking_score - threshold + 0.20, 0.05)
             strengths.append((pair, (edge * liquidity_multiplier * quality_multiplier) / vol))
+
         return self.capped_inverse_vol_weights(strengths)
 
     def _position_weight_proxy(
-            self,
-            positions: Dict[str, float],
-            features: FeatureMap,
-            history: Dict[str, Deque[Dict[str, float]]],
+        self,
+        positions: Dict[str, float],
+        features: FeatureMap,
+        history: Dict[str, Deque[Dict[str, float]]],
     ) -> Dict[str, float]:
-        notional_map: Dict[str, float] = {}
-        for pair, quantity in positions.items():
-            price = features.get(pair, {}).get("price")
-            if price is None and history.get(pair):
-                price = float(history[pair][-1].get("price", 0.0))
-            if price and price > 0:
-                notional_map[pair] = quantity * price
+        """
+        用于在没有新 target，或者需要给风险层一个“现有仓位结构”输入时，
+        构造一个稳定的权重代理。
+        """
+        if not positions:
+            return {}
 
-        total = sum(notional_map.values())
-        if total > 1e-12:
-            return {
-                pair: value / total * self.cfg.target_gross_exposure
-                for pair, value in notional_map.items()
-            }
-        return {}
+        strengths: List[Tuple[str, float]] = []
+        for pair, quantity in positions.items():
+            if quantity <= 0:
+                continue
+
+            feature = features.get(pair)
+            if feature is not None:
+                vol = clamp(feature.get("vol60", self.cfg.vol_floor), self.cfg.vol_floor, self.cfg.vol_cap)
+                score = max(feature.get("score", 0.0), 0.0)
+                strength = max(0.05, (0.30 + score) / vol)
+            else:
+                # 没 feature 时退化成等权强度
+                strength = 1.0
+
+            strengths.append((pair, strength))
+
+        if not strengths:
+            return {}
+
+        return self.capped_inverse_vol_weights(strengths)
+
+    def _range_keep_weights(
+        self,
+        positions: Dict[str, float],
+        features: FeatureMap,
+        history: Dict[str, Deque[Dict[str, float]]],
+    ) -> Dict[str, float]:
+        """
+        range 环境下不直接清空，而是给现有持仓一个较小总暴露的保留权重。
+        """
+        base = self._position_weight_proxy(positions, features, history)
+        if not base:
+            return {}
+
+        total = sum(base.values())
+        if total <= 1e-12:
+            return {}
+
+        target_total = min(self.cfg.target_gross_exposure, self.range_keep_exposure)
+        return {
+            pair: weight / total * target_total
+            for pair, weight in base.items()
+            if weight > 0
+        }
 
     def evaluate_portfolio_risk(
             self,
@@ -1086,11 +1212,13 @@ class MomentumStrategy:
 
         # 如果处于 range / panic，不开新仓；
         # 但如果已经有持仓，则保留现有持仓作为风险层输入，让第二层决定缩多少仓
-        if regime_name in ["range", "panic"]:
+        if regime_name == "range":
             if positions:
-                raw_weights = self._position_weight_proxy(positions, features, history)
+                raw_weights = self._range_keep_weights(positions, features, history)
             else:
                 raw_weights = {}
+        elif regime_name == "panic":
+            raw_weights = {}
 
         # 第二层：只负责风险覆盖与仓位缩放
         portfolio_risk = self.evaluate_portfolio_risk(
