@@ -121,13 +121,13 @@ def load_price_data(
 
     price_df = pd.concat(series_map, axis=1).sort_index()
     if frequency == "auto":
-        for label, rule in [("daily", "1D"), ("hourly", "1H"), ("raw", None)]:
+        for label, rule in [("daily", "1D"), ("hourly", "1h"), ("raw", None)]:
             candidate = _resample_price_frame(price_df, rule)
             if len(candidate) >= min_periods:
                 return candidate, label
         return _resample_price_frame(price_df, None), "raw"
 
-    mapping = {"daily": "1D", "hourly": "1H", "raw": None}
+    mapping = {"daily": "1D", "hourly": "1h", "raw": None}
     selected = _resample_price_frame(price_df, mapping.get(frequency, None))
     return selected, frequency if frequency in mapping else "raw"
 
@@ -623,13 +623,13 @@ class MomentumStrategy:
         )
 
         # --- turnover reduction / less aggressive sell ---
-        self.rank_retention_buffer = 0.18
-        self.holding_bonus_floor = 0.22
+        self.rank_retention_buffer = 0.25
+        self.holding_bonus_floor = 0.30
 
         # anti-chase for new entries
-        self.pump_chase_cutoff = 0.035
-        self.pullback_entry_floor = -0.025
-        self.range_keep_exposure = 0.30
+        self.pump_chase_cutoff = 0.025
+        self.pullback_entry_floor = -0.020
+        self.range_keep_exposure = 0.25
         self.risk_exposure_haircut = 0.60
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
@@ -1265,15 +1265,15 @@ class MomentumStrategy:
 
         regime_name = regime["regime"]
 
-        # 绗竴灞傦細鍙仛鏂瑰悜杩囨护锛屼笉鍋氫粨浣嶇缉鏀?        # trend / neutral 鍏佽寮€鏂颁粨锛況ange / panic 涓嶅紑鏂颁粨
+        # first layer: direction filter only; trend/neutral can open new positions
         allow_new_entries = (
-                regime_name in ["trend", "neutral"]
-                and self.risk_on(snapshot, prev_risk_on)
+            regime_name in ["trend", "neutral"]
+            and self.risk_on(snapshot, prev_risk_on)
         )
 
-        # 鍘熷鏂瑰悜灞傜洰鏍囨潈閲嶏細杩欓噷鍙〃杈锯€滄兂涔拌皝鈥濓紝涓嶈〃杈炬渶缁堟€讳粨浣?        raw_weights = self.target_weights(features, allow_new_entries, positions)
+        raw_weights = self.target_weights(features, allow_new_entries, positions)
 
-        # 濡傛灉澶勪簬 range / panic锛屼笉寮€鏂颁粨锛?        # 浣嗗鏋滃凡缁忔湁鎸佷粨锛屽垯淇濈暀鐜版湁鎸佷粨浣滀负椋庨櫓灞傝緭鍏ワ紝璁╃浜屽眰鍐冲畾缂╁灏戜粨
+        # range/panic should not open new positions; keep only retained risk exposure when needed
         if regime_name == "range":
             if positions:
                 raw_weights = self._range_keep_weights(positions, features, history)
@@ -1291,9 +1291,10 @@ class MomentumStrategy:
             positions=positions,
         )
 
-        # 鏈€缁?risk_on 鍙〃绀衡€滄槸鍚﹀厑璁告柊澧為闄┾€?        # risk_off 鏃朵笉鏂板锛況ange / panic 鏃朵篃涓嶆柊澧?        risk_on = allow_new_entries and portfolio_risk.market_regime != "risk_off"
+        # final risk_on only controls whether new risk can be added
+        risk_on = allow_new_entries and portfolio_risk.market_regime != "risk_off"
 
-        # 绗簩灞傚厛璋冪粨鏋勶紝鍐嶇粺涓€缂╂斁鎬?exposure
+        # risk layer adjusts structure first, then rescales total exposure
         final_weights = portfolio_risk.adjusted_weights or raw_weights
         if final_weights:
             total = sum(final_weights.values())
@@ -1304,7 +1305,6 @@ class MomentumStrategy:
                 }
             else:
                 final_weights = {}
-
         return {
             "features": features,
             "snapshot": snapshot,
@@ -1331,4 +1331,5 @@ class MomentumStrategy:
                 "mu_error": self.mu_model.error,
             },
         }
+
 

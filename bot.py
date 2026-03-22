@@ -62,15 +62,16 @@ class Config:
     vol_floor: float
     vol_cap: float
     holding_score_bonus: float
-    risk_cov_window: int
     risk_data_frequency: str
-    risk_return_method: str
     risk_min_periods: int
+    risk_return_method: str
+    risk_cov_window: int
     risk_on_portfolio_vol_threshold: float
     risk_off_portfolio_vol_threshold: float
     risk_on_correlation_threshold: float
     risk_off_correlation_threshold: float
-    diversification_breakdown_corr_threshold: float
+    risk_vol_score_weight: float
+    risk_corr_score_weight: float
     risk_on_exposure_multiplier: float
     neutral_exposure_multiplier: float
     risk_off_exposure_multiplier: float
@@ -78,8 +79,8 @@ class Config:
     target_portfolio_volatility: float
     min_vol_target_scale: float
     max_vol_target_scale: float
-    risk_vol_score_weight: float
-    risk_corr_score_weight: float
+    diversification_breakdown_corr_threshold: float
+    diversification_breakdown_exposure_multiplier: float
     risk_on_weight_penalty_scale: float
     neutral_weight_penalty_scale: float
     risk_off_weight_penalty_scale: float
@@ -87,7 +88,6 @@ class Config:
     risk_weight_corr_penalty: float
     diversification_alt_weight_multiplier: float
     diversification_core_asset_multiplier: float
-    diversification_breakdown_exposure_multiplier: float
     diversification_core_assets: str
     high_vol_feature_cutoff_multiplier: float
     high_vol_feature_weight_multiplier: float
@@ -95,6 +95,14 @@ class Config:
     per_position_trailing_stop: float
     max_portfolio_drawdown: float
     cooldown_minutes: int
+    portfolio_drawdown_cooldown_minutes: int
+    profit_protect_threshold: float
+    profit_protect_score_decay_fraction: float
+    profit_protect_not_in_targets_fraction: float
+    startup_warmup_minutes: int
+    max_data_delay_minutes: int
+    min_fresh_points_after_start: int
+    min_fresh_span_minutes: int
     request_timeout: int
     max_retries: int
     retry_sleep_seconds: float
@@ -126,15 +134,15 @@ class Config:
             portfolio_log_csv=log_dir / "portfolio.csv",
             signal_log_csv=log_dir / "signals.csv",
             top_n=int(os.getenv("TOP_N", "3")),
-            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.78")),
+            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.72")),
             max_single_weight=float(os.getenv("MAX_SINGLE_WEIGHT", "0.28")),
-            cash_buffer=float(os.getenv("CASH_BUFFER", "0.20")),
-            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.60")),
+            cash_buffer=float(os.getenv("CASH_BUFFER", "0.25")),
+            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.68")),
             exit_score_threshold=float(os.getenv("EXIT_SCORE_THRESHOLD", "0.12")),
             rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.03")),
             min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "25")),
             spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.006")),
-            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "50000")),
+            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "150000")),
             max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.05")),
             market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0005")),
             market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.52")),
@@ -144,40 +152,58 @@ class Config:
             regime_exit_positive_score_ratio_threshold=float(os.getenv("REGIME_EXIT_POSITIVE_SCORE_RATIO_THRESHOLD", "0.42")),
             vol_floor=float(os.getenv("VOL_FLOOR", "0.004")),
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
-            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.08")),
+            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.12")),
+            per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.035")),
+            risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "raw").strip().lower(),
+            risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "60")),
+            risk_return_method=os.getenv("RISK_RETURN_METHOD", "log").strip().lower(),
             risk_cov_window=int(os.getenv("RISK_COV_WINDOW", "60")),
-            risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "auto").strip().lower(),
-            risk_return_method=os.getenv("RISK_RETURN_METHOD", "pct_change").strip().lower(),
-            risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "30")),
-            risk_on_portfolio_vol_threshold=float(os.getenv("RISK_ON_PORTFOLIO_VOL_THRESHOLD", "0.03")),
-            risk_off_portfolio_vol_threshold=float(os.getenv("RISK_OFF_PORTFOLIO_VOL_THRESHOLD", "0.07")),
+            risk_on_portfolio_vol_threshold=float(os.getenv("RISK_ON_PORTFOLIO_VOL_THRESHOLD", "0.015")),
+            risk_off_portfolio_vol_threshold=float(os.getenv("RISK_OFF_PORTFOLIO_VOL_THRESHOLD", "0.035")),
             risk_on_correlation_threshold=float(os.getenv("RISK_ON_CORRELATION_THRESHOLD", "0.35")),
             risk_off_correlation_threshold=float(os.getenv("RISK_OFF_CORRELATION_THRESHOLD", "0.65")),
-            diversification_breakdown_corr_threshold=float(os.getenv("DIVERSIFICATION_BREAKDOWN_CORR_THRESHOLD", "0.72")),
-            risk_on_exposure_multiplier=float(os.getenv("RISK_ON_EXPOSURE_MULTIPLIER", "1.0")),
-            neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.75")),
-            risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.35")),
-            enable_volatility_targeting=env_bool("ENABLE_VOLATILITY_TARGETING", False),
-            target_portfolio_volatility=float(os.getenv("TARGET_PORTFOLIO_VOLATILITY", "0.04")),
-            min_vol_target_scale=float(os.getenv("MIN_VOL_TARGET_SCALE", "0.25")),
-            max_vol_target_scale=float(os.getenv("MAX_VOL_TARGET_SCALE", "1.0")),
             risk_vol_score_weight=float(os.getenv("RISK_VOL_SCORE_WEIGHT", "0.5")),
             risk_corr_score_weight=float(os.getenv("RISK_CORR_SCORE_WEIGHT", "0.5")),
-            risk_on_weight_penalty_scale=float(os.getenv("RISK_ON_WEIGHT_PENALTY_SCALE", "0.25")),
-            neutral_weight_penalty_scale=float(os.getenv("NEUTRAL_WEIGHT_PENALTY_SCALE", "0.75")),
-            risk_off_weight_penalty_scale=float(os.getenv("RISK_OFF_WEIGHT_PENALTY_SCALE", "1.25")),
+            risk_on_exposure_multiplier=float(os.getenv("RISK_ON_EXPOSURE_MULTIPLIER", "1.0")),
+            neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.7")),
+            risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.35")),
+            enable_volatility_targeting=env_bool("ENABLE_VOLATILITY_TARGETING", True),
+            target_portfolio_volatility=float(os.getenv("TARGET_PORTFOLIO_VOLATILITY", "0.020")),
+            min_vol_target_scale=float(os.getenv("MIN_VOL_TARGET_SCALE", "0.35")),
+            max_vol_target_scale=float(os.getenv("MAX_VOL_TARGET_SCALE", "1.20")),
+            diversification_breakdown_corr_threshold=float(
+                os.getenv("DIVERSIFICATION_BREAKDOWN_CORR_THRESHOLD", "0.75")),
+            diversification_breakdown_exposure_multiplier=float(
+                os.getenv("DIVERSIFICATION_BREAKDOWN_EXPOSURE_MULTIPLIER", "0.75")),
+            risk_on_weight_penalty_scale=float(os.getenv("RISK_ON_WEIGHT_PENALTY_SCALE", "0.10")),
+            neutral_weight_penalty_scale=float(os.getenv("NEUTRAL_WEIGHT_PENALTY_SCALE", "0.25")),
+            risk_off_weight_penalty_scale=float(os.getenv("RISK_OFF_WEIGHT_PENALTY_SCALE", "0.50")),
             risk_weight_vol_penalty=float(os.getenv("RISK_WEIGHT_VOL_PENALTY", "1.0")),
             risk_weight_corr_penalty=float(os.getenv("RISK_WEIGHT_CORR_PENALTY", "1.0")),
-            diversification_alt_weight_multiplier=float(os.getenv("DIVERSIFICATION_ALT_WEIGHT_MULTIPLIER", "0.45")),
-            diversification_core_asset_multiplier=float(os.getenv("DIVERSIFICATION_CORE_ASSET_MULTIPLIER", "1.1")),
-            diversification_breakdown_exposure_multiplier=float(os.getenv("DIVERSIFICATION_BREAKDOWN_EXPOSURE_MULTIPLIER", "0.75")),
+            diversification_alt_weight_multiplier=float(
+                os.getenv("DIVERSIFICATION_ALT_WEIGHT_MULTIPLIER", "0.85")
+            ),
+            diversification_core_asset_multiplier=float(
+                os.getenv("DIVERSIFICATION_CORE_ASSET_MULTIPLIER", "1.15")
+            ),
             diversification_core_assets=os.getenv("DIVERSIFICATION_CORE_ASSETS", "BTC,ETH"),
-            high_vol_feature_cutoff_multiplier=float(os.getenv("HIGH_VOL_FEATURE_CUTOFF_MULTIPLIER", "1.15")),
-            high_vol_feature_weight_multiplier=float(os.getenv("HIGH_VOL_FEATURE_WEIGHT_MULTIPLIER", "0.8")),
-            per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.035")),
+            high_vol_feature_cutoff_multiplier=float(
+                os.getenv("HIGH_VOL_FEATURE_CUTOFF_MULTIPLIER", "0.85")
+            ),
+            high_vol_feature_weight_multiplier=float(
+                os.getenv("HIGH_VOL_FEATURE_WEIGHT_MULTIPLIER", "0.80")
+            ),
             per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.045")),
             max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
+            portfolio_drawdown_cooldown_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_MINUTES", "1440")),
+            profit_protect_threshold=float(os.getenv("PROFIT_PROTECT_THRESHOLD", "0.10")),
+            profit_protect_score_decay_fraction=float(os.getenv("PROFIT_PROTECT_SCORE_DECAY_FRACTION", "0.18")),
+            profit_protect_not_in_targets_fraction=float(os.getenv("PROFIT_PROTECT_NOT_IN_TARGETS_FRACTION", "0.25")),
+            startup_warmup_minutes=int(os.getenv("STARTUP_WARMUP_MINUTES", "30")),
+            max_data_delay_minutes=int(os.getenv("MAX_DATA_DELAY_MINUTES", "2")),
+            min_fresh_points_after_start=int(os.getenv("MIN_FRESH_POINTS_AFTER_START", "30")),
+            min_fresh_span_minutes=int(os.getenv("MIN_FRESH_SPAN_MINUTES", "30")),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT", "5")),
             max_retries=int(os.getenv("MAX_RETRIES", "1")),
             retry_sleep_seconds=float(os.getenv("RETRY_SLEEP_SECONDS", "1.5")),
@@ -259,6 +285,7 @@ class PositionMeta:
     last_trade_ts: int
     last_signal_score: float
     last_reason: str = ""
+    not_in_targets_bars: int = 0
 
 
 @dataclass
@@ -278,6 +305,7 @@ class BotState:
     positions_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     start_ts: int = 0
     risk_on: bool = False
+    portfolio_reentry_allowed_at: int = 0
 
     def __post_init__(self) -> None:
         if self.start_ts == 0:
@@ -296,6 +324,7 @@ def load_state() -> BotState:
             positions_meta=dict(raw.get("positions_meta", {})),
             start_ts=int(raw.get("start_ts", now_ms())),
             risk_on=bool(raw.get("risk_on", False)),
+            portfolio_reentry_allowed_at=int(raw.get("portfolio_reentry_allowed_at", 0)),
         )
     except Exception as exc:
         logger.warning("Failed to load state.json: %s", exc)
@@ -333,6 +362,8 @@ def load_history() -> Dict[str, Deque[Dict[str, float]]]:
                         "ask": safe_float(row.get("ask")),
                         "change_24h": safe_float(row.get("change_24h")),
                         "unit_trade_value": safe_float(row.get("unit_trade_value")),
+                        "quote_volume": safe_float(row.get("quote_volume", row.get("unit_trade_value"))),
+                        "base_volume": safe_float(row.get("base_volume")),
                     }
                 )
             if restored:
@@ -361,6 +392,7 @@ class RoostooMomentumBot:
         self._consecutive_loop_failures = 0
         self._has_lock = False
         self.last_rebalance_ts = 0
+        self.session_start_ts = now_ms()
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
         self.acquire_instance_lock()
@@ -477,8 +509,104 @@ class RoostooMomentumBot:
                     "ask": safe_float(ticker.get("MinAsk")),
                     "change_24h": safe_float(ticker.get("Change")),
                     "unit_trade_value": safe_float(ticker.get("UnitTradeValue")),
+                    "quote_volume": safe_float(ticker.get("UnitTradeValue")),
+                    "base_volume": safe_float(ticker.get("CoinTradeValue")),
                 }
             )
+
+    def freshness_reference_pair(self) -> Optional[str]:
+        if "BTC/USD" in self.trade_pairs:
+            return "BTC/USD"
+        if self.trade_pairs:
+            return sorted(self.trade_pairs.keys())[0]
+        return None
+
+    def latest_history_ts(self, pair: Optional[str] = None) -> int:
+        if pair:
+            series = self.history.get(pair)
+            if series:
+                return int(series[-1].get("ts", 0))
+            return 0
+
+        latest_ts = 0
+        for series in self.history.values():
+            if not series:
+                continue
+            latest_ts = max(latest_ts, int(series[-1].get("ts", 0)))
+        return latest_ts
+
+    def fresh_points_after_start(self, pair: str) -> List[Dict[str, float]]:
+        series = self.history.get(pair, deque())
+        return [row for row in series if int(row.get("ts", 0)) >= self.session_start_ts]
+
+    def pair_freshness_status(self, pair: str) -> tuple[bool, str]:
+        latest_ts = self.latest_history_ts(pair)
+        if latest_ts <= 0:
+            return False, f"{pair}:no_history"
+
+        delay_ms = now_ms() - latest_ts
+        if delay_ms > self.cfg.max_data_delay_minutes * 60_000:
+            return False, (
+                f"{pair}:stale_latest delay_min={delay_ms / 60_000:.1f} "
+                f"limit={self.cfg.max_data_delay_minutes}"
+            )
+
+        fresh_rows = self.fresh_points_after_start(pair)
+        if len(fresh_rows) < self.cfg.min_fresh_points_after_start:
+            return False, (
+                f"{pair}:insufficient_fresh_points count={len(fresh_rows)} "
+                f"need={self.cfg.min_fresh_points_after_start}"
+            )
+
+        fresh_span_ms = int(fresh_rows[-1]["ts"] - fresh_rows[0]["ts"]) if len(fresh_rows) >= 2 else 0
+        if fresh_span_ms < self.cfg.min_fresh_span_minutes * 60_000:
+            return False, (
+                f"{pair}:insufficient_fresh_span span_min={fresh_span_ms / 60_000:.1f} "
+                f"need={self.cfg.min_fresh_span_minutes}"
+            )
+
+        return True, (
+            f"{pair}:fresh ok latest_delay_min={delay_ms / 60_000:.1f} "
+            f"fresh_points={len(fresh_rows)} span_min={fresh_span_ms / 60_000:.1f}"
+        )
+
+    def freshness_check_pairs(self) -> List[str]:
+        preferred = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "SUI/USD"]
+        pairs = [pair for pair in preferred if pair in self.trade_pairs]
+        if len(pairs) >= 3:
+            return pairs[:5]
+
+        others = sorted(pair for pair in self.trade_pairs if pair not in pairs)
+        return (pairs + others)[:5]
+
+    def history_is_fresh_enough(self) -> tuple[bool, str]:
+        check_pairs = self.freshness_check_pairs()
+        if not check_pairs:
+            return False, "no_check_pairs"
+
+        ok_pairs = []
+        bad_reasons = []
+
+        for pair in check_pairs:
+            ok, reason = self.pair_freshness_status(pair)
+            if ok:
+                ok_pairs.append(pair)
+            else:
+                bad_reasons.append(reason)
+
+        ok_ratio = len(ok_pairs) / len(check_pairs)
+        need_ok = min(3, len(check_pairs))
+
+        if len(ok_pairs) >= need_ok or ok_ratio >= 0.6:
+            return True, (
+                f"fresh basket ok ok={len(ok_pairs)}/{len(check_pairs)} "
+                f"pairs={ok_pairs}"
+            )
+
+        return False, (
+            f"fresh basket failed ok={len(ok_pairs)}/{len(check_pairs)} "
+            f"bad={bad_reasons[:3]}"
+        )
 
     def get_wallet(self) -> Dict[str, Dict[str, float]]:
         response = self.client.balance()
@@ -596,16 +724,42 @@ class RoostooMomentumBot:
             return 0.0
         return quantity
 
-    def quantity_for_fraction(self, pair: str, quantity: float, price: float, fraction: float) -> float:
-        if quantity <= 0 or price <= 0:
+    def normalize_order_quantity(self, pair: str, quantity: float, price: float) -> float:
+        rules = self.trade_pairs[pair]
+        amount_precision = int(rules.get("AmountPrecision", 6))
+        min_order = safe_float(rules.get("MiniOrder", 1.0))
+
+        if price <= 0 or quantity <= 0:
             return 0.0
-        fraction = max(0.0, min(1.0, fraction))
-        if fraction <= 0:
+
+        normalized = round_down(quantity, amount_precision)
+        if normalized <= 0:
             return 0.0
-        if fraction >= 1.0:
-            return quantity
-        notional_usd = quantity * price * fraction
-        return min(quantity, self.quantity_for_notional(pair, notional_usd, price))
+
+        if normalized * price < min_order:
+            return 0.0
+
+        return normalized
+
+    def sell_quantity_for_position(self, pair: str, quantity: float, price: float) -> float:
+        """
+        统一所有 SELL 路径的数量规整。
+        优先按持仓原始数量向下取整到交易精度，避免超卖；
+        若规整后达不到最小下单额，则返回 0。
+        """
+        return self.normalize_order_quantity(pair, quantity, price)
+
+    def sell_quantity_for_fraction(self, pair: str, quantity: float, price: float, fraction: float) -> float:
+        if price <= 0 or quantity <= 0 or fraction <= 0:
+            return 0.0
+        if fraction >= 0.999999:
+            return self.sell_quantity_for_position(pair, quantity, price)
+        return self.normalize_order_quantity(pair, quantity * fraction, price)
+
+    def unrealized_return(self, entry_price: float, price: float) -> float:
+        if entry_price <= 0 or price <= 0:
+            return 0.0
+        return price / entry_price - 1.0
 
     def log_trade(
         self,
@@ -762,82 +916,309 @@ class RoostooMomentumBot:
         meta.last_signal_score = score
         return meta
 
-    def exit_reasons(self, pair: str, meta: PositionMeta, price: float, score: float, targets: Dict[str, float]) -> List[str]:
+    def update_not_in_targets_counter(
+            self,
+            meta: PositionMeta,
+            pair: str,
+            targets: Dict[str, float],
+    ) -> int:
+        """
+        只有当 pair 不在 targets 或目标权重极小的时候，才累计计数。
+        一旦重新回到 targets，就清零。
+        """
+        target_weight = float(targets.get(pair, 0.0))
+        if target_weight > 1e-12:
+            meta.not_in_targets_bars = 0
+        else:
+            meta.not_in_targets_bars += 1
+        return meta.not_in_targets_bars
+
+    def not_in_targets_confirmed(
+            self,
+            meta: PositionMeta,
+            confirm_bars: int = 3,
+    ) -> bool:
+        return meta.not_in_targets_bars >= confirm_bars
+
+    def exit_reasons(
+            self,
+            pair: str,
+            meta: PositionMeta,
+            price: float,
+            score: float,
+            targets: Dict[str, float],
+    ) -> List[str]:
         reasons: List[str] = []
+
+        # 1) 价格型风控：始终立即执行，绝不延迟
         if price <= meta.entry_price * (1 - self.cfg.per_position_stop_loss):
             reasons.append("stop_loss")
         if price <= meta.highest_price * (1 - self.cfg.per_position_trailing_stop):
             reasons.append("trailing_stop")
-        if score < self.cfg.exit_score_threshold:
-            reasons.append("score_decay")
-        if pair not in targets:
-            reasons.append("not_in_targets")
+
+        # 2) 先更新 not_in_targets 计数
+        target_weight = float(targets.get(pair, 0.0))
+        not_in_targets_count = self.update_not_in_targets_counter(meta, pair, targets)
+        in_targets = target_weight > 1e-12
+        confirmed_not_in_targets = self.not_in_targets_confirmed(meta, confirm_bars=3)
+
+        # 3) score_decay 的处理分两种情况：
+        #    - 仍在 targets 内：保持原逻辑，立即执行
+        #    - 已不在 targets：必须等 not_in_targets 也确认后，才允许触发退出
+        score_decay = score < self.cfg.exit_score_threshold
+
+        if in_targets:
+            if score_decay:
+                reasons.append("score_decay")
+        else:
+            if confirmed_not_in_targets:
+                if score_decay:
+                    reasons.append("score_decay")
+                reasons.append("not_in_targets")
+            else:
+                logger.info(
+                    "Hold %s pending not_in_targets confirmation: %d/3 bars score_decay=%s",
+                    pair,
+                    not_in_targets_count,
+                    score_decay,
+                )
+
+        meta.last_reason = "+".join(reasons) if reasons else "hold"
         return reasons
 
     def manage_existing_positions(
-        self,
-        positions: Dict[str, float],
-        tickers: Dict[str, Any],
-        features: Dict[str, Dict[str, float]],
-        targets: Dict[str, float],
+            self,
+            positions: Dict[str, float],
+            tickers: Dict[str, Any],
+            features: Dict[str, Dict[str, float]],
+            targets: Dict[str, float],
     ) -> set[str]:
         skip_trim_pairs: set[str] = set()
         for pair, quantity in list(positions.items()):
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
-            score = features.get(pair, {}).get("score", -999.0)
+
+            feature = features.get(pair)
+            fresh_ok, fresh_reason = self.pair_freshness_status(pair)
+
+            # 没有 feature 或数据不 fresh 时：
+            # 1) 不做基于 score 的主动退出
+            # 2) 但仍保留价格型风控
+            if feature is None or not fresh_ok:
+                prev_meta = self.position_meta(pair)
+                fallback_score = prev_meta.last_signal_score if prev_meta is not None else 0.0
+                meta = self.build_position_meta(pair, quantity, price, fallback_score)
+
+                reasons: List[str] = []
+                if price <= meta.entry_price * (1 - self.cfg.per_position_stop_loss):
+                    reasons.append("stop_loss")
+                if price <= meta.highest_price * (1 - self.cfg.per_position_trailing_stop):
+                    reasons.append("trailing_stop")
+
+                if reasons:
+                    reason_text = "+".join(reasons)
+                    if not fresh_ok:
+                        reason_text += f"+stale_data"
+
+                    sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
+                    if sell_quantity <= 0:
+                        logger.info(
+                            "Skip SELL %s because normalized quantity is too small. raw_qty=%.12f",
+                            pair,
+                            quantity,
+                        )
+                        meta.last_reason = "sell_qty_too_small"
+                        self.set_position_meta(meta)
+                        continue
+
+                    try:
+                        ok = self.submit_market_order(
+                            pair,
+                            "SELL",
+                            sell_quantity,
+                            reason_text,
+                            fallback_score,
+                            price,
+                        )
+                    except UnknownOrderStateError as exc:
+                        logger.exception(
+                            "Exit SELL status unknown for %s. qty=%.12f err=%s",
+                            pair,
+                            sell_quantity,
+                            exc,
+                        )
+                        meta.last_reason = "sell_unknown_state"
+                        self.set_position_meta(meta)
+                        continue
+                    except Exception as exc:
+                        logger.exception(
+                            "Exit SELL failed for %s. qty=%.12f err=%s",
+                            pair,
+                            sell_quantity,
+                            exc,
+                        )
+                        meta.last_reason = "sell_failed"
+                        self.set_position_meta(meta)
+                        continue
+
+                    if ok:
+                        if sell_quantity >= quantity * 0.999999:
+                            self.remove_position_meta(pair)
+                        self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                    else:
+                        self.set_position_meta(meta)
+                    continue
+
+                meta.last_reason = "hold_stale" if not fresh_ok else "hold_no_feature"
+                self.set_position_meta(meta)
+                logger.info(
+                    "Hold existing %s without score-based exit: feature=%s fresh=%s reason=%s",
+                    pair,
+                    feature is not None,
+                    fresh_ok,
+                    fresh_reason if not fresh_ok else "ok",
+                )
+                continue
+
+            score = feature["score"]
             meta = self.build_position_meta(pair, quantity, price, score)
             reasons = self.exit_reasons(pair, meta, price, score, targets)
+
             if reasons:
+                unrealized_return = self.unrealized_return(meta.entry_price, price)
+                protected_profit = unrealized_return >= self.cfg.profit_protect_threshold
                 if "stop_loss" in reasons or "trailing_stop" in reasons:
                     sell_fraction = 1.0
                 elif "not_in_targets" in reasons:
-                    sell_fraction = 0.50
+                    sell_fraction = (
+                        self.cfg.profit_protect_not_in_targets_fraction
+                        if protected_profit
+                        else 0.30
+                    )
                 else:
-                    sell_fraction = 0.35
-                sell_quantity = self.quantity_for_fraction(pair, quantity, price, sell_fraction)
+                    sell_fraction = (
+                        self.cfg.profit_protect_score_decay_fraction
+                        if protected_profit
+                        else 0.25
+                    )
+                sell_quantity = self.sell_quantity_for_fraction(pair, quantity, price, sell_fraction)
                 if sell_quantity <= 0:
+                    logger.info(
+                        "Skip SELL %s because normalized quantity is too small. raw_qty=%.12f",
+                        pair,
+                        quantity,
+                    )
+                    meta.last_reason = "sell_qty_too_small"
                     self.set_position_meta(meta)
                     continue
-                if self.submit_market_order(pair, "SELL", sell_quantity, "+".join(reasons), score, price):
+
+                try:
+                    ok = self.submit_market_order(
+                        pair,
+                        "SELL",
+                        sell_quantity,
+                        "+".join(reasons),
+                        score,
+                        price,
+                    )
+                except UnknownOrderStateError as exc:
+                    logger.exception(
+                        "Exit SELL status unknown for %s. qty=%.12f err=%s",
+                        pair,
+                        sell_quantity,
+                        exc,
+                    )
+                    meta.last_reason = "sell_unknown_state"
+                    self.set_position_meta(meta)
+                    continue
+                except Exception as exc:
+                    logger.exception(
+                        "Exit SELL failed for %s. qty=%.12f err=%s",
+                        pair,
+                        sell_quantity,
+                        exc,
+                    )
+                    meta.last_reason = "sell_failed"
+                    self.set_position_meta(meta)
+                    continue
+
+                if ok:
                     if sell_quantity >= quantity * 0.999999:
                         self.remove_position_meta(pair)
-                        self.set_cooldown(pair, self.cfg.cooldown_minutes)
-                    else:
-                        meta.quantity = max(quantity - sell_quantity, 0.0)
+                    elif sell_fraction < 1.0:
+                        meta.quantity = quantity - sell_quantity
+                        meta.last_trade_ts = now_ms()
+                        meta.last_reason = "+".join(reasons)
                         self.set_position_meta(meta)
                         skip_trim_pairs.add(pair)
+                    self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                else:
+                    self.set_position_meta(meta)
                 continue
+
             self.set_position_meta(meta)
         return skip_trim_pairs
 
     def trim_positions(
-        self,
-        portfolio: PortfolioSnapshot,
-        tickers: Dict[str, Any],
-        features: Dict[str, Dict[str, float]],
-        targets: Dict[str, float],
-        rebalance_threshold: float,
-        skip_pairs: Optional[set[str]] = None,
+            self,
+            portfolio: PortfolioSnapshot,
+            tickers: Dict[str, Any],
+            features: Dict[str, Dict[str, float]],
+            targets: Dict[str, float],
+            rebalance_threshold: float,
+            skip_pairs: Optional[set[str]] = None,
     ) -> None:
+        skip_pairs = skip_pairs or set()
         for pair, quantity in list(portfolio.positions.items()):
-            if skip_pairs and pair in skip_pairs:
+            if pair in skip_pairs:
                 continue
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
+
             target_usd = portfolio.equity * targets.get(pair, 0.0)
             current_usd = portfolio.current_notional.get(pair, 0.0)
             trim_usd = current_usd - target_usd
             if trim_usd < rebalance_threshold:
                 continue
-            sell_quantity = quantity if target_usd <= 0 else self.quantity_for_notional(pair, trim_usd, price)
+
+            if target_usd <= 0:
+                sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
+                reason = "target_exit_retry"
+            else:
+                sell_quantity = self.quantity_for_notional(pair, trim_usd, price)
+                sell_quantity = min(
+                    sell_quantity,
+                    self.sell_quantity_for_position(pair, quantity, price),
+                )
+                reason = "target_trim"
+
             if sell_quantity <= 0:
                 continue
+
             score = features.get(pair, {}).get("score", -999.0)
-            reason = "target_exit_retry" if target_usd <= 0 else "target_trim"
-            if self.submit_market_order(pair, "SELL", sell_quantity, reason, score, price):
+
+            try:
+                ok = self.submit_market_order(pair, "SELL", sell_quantity, reason, score, price)
+            except UnknownOrderStateError as exc:
+                logger.exception(
+                    "Trim SELL status unknown for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "Trim SELL failed for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+
+            if ok:
                 if sell_quantity >= quantity * 0.999999:
                     self.remove_position_meta(pair)
                     if target_usd <= 0:
@@ -870,94 +1251,174 @@ class RoostooMomentumBot:
         self.set_position_meta(meta)
 
     def add_target_positions(
-        self,
-        portfolio: PortfolioSnapshot,
-        tickers: Dict[str, Any],
-        features: Dict[str, Dict[str, float]],
-        targets: Dict[str, float],
-        rebalance_threshold: float,
+            self,
+            portfolio: PortfolioSnapshot,
+            tickers: Dict[str, Any],
+            features: Dict[str, Dict[str, float]],
+            targets: Dict[str, float],
+            rebalance_threshold: float,
     ) -> None:
         for pair, weight in sorted(targets.items(), key=lambda item: item[1], reverse=True):
             if self.in_cooldown(pair):
                 continue
+
+            fresh_ok, fresh_reason = self.pair_freshness_status(pair)
+            if not fresh_ok:
+                logger.info("Skip BUY %s due to stale pair data: %s", pair, fresh_reason)
+                continue
+
+            feature = features.get(pair)
+            if feature is None:
+                logger.info("Skip BUY %s due to missing feature row.", pair)
+                continue
+
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
+
             target_usd = portfolio.equity * weight
             current_usd = portfolio.current_notional.get(pair, 0.0)
             diff_usd = target_usd - current_usd
             if diff_usd < rebalance_threshold:
                 continue
+
             usable_cash = max(0.0, portfolio.usd_free - portfolio.equity * self.cfg.cash_buffer)
             if usable_cash <= 0:
                 continue
+
             buy_usd = min(diff_usd, usable_cash)
             quantity = self.quantity_for_notional(pair, buy_usd, price)
             if quantity <= 0:
                 continue
-            score = features[pair]["score"]
+
+            score = feature["score"]
             if self.submit_market_order(pair, "BUY", quantity, "target_rebalance", score, price):
                 self.record_buy_fill(pair, quantity, price, score)
                 portfolio.usd_free -= quantity * price
 
     def exit_all_positions(self, positions: Dict[str, float], tickers: Dict[str, Any], reason: str) -> None:
-        for pair, quantity in positions.items():
+        for pair, quantity in list(positions.items()):
             if quantity <= 0:
                 continue
-            price = self.pair_price(pair, tickers)
-            self.submit_market_order(pair, "SELL", quantity, reason, -999.0, price)
-            self.remove_position_meta(pair)
-            self.set_cooldown(pair, self.cfg.cooldown_minutes)
 
-    def reduce_all_positions(
-        self,
-        positions: Dict[str, float],
-        tickers: Dict[str, Any],
-        reason: str,
-        fraction: float,
-    ) -> set[str]:
-        reduced_pairs: set[str] = set()
-        for pair, quantity in positions.items():
-            if quantity <= 0:
-                continue
             price = self.pair_price(pair, tickers)
-            sell_quantity = self.quantity_for_fraction(pair, quantity, price, fraction)
-            if sell_quantity <= 0:
+            if price <= 0:
+                logger.warning("Skip forced SELL %s due to invalid price.", pair)
                 continue
-            if self.submit_market_order(pair, "SELL", sell_quantity, reason, -999.0, price):
+
+            sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
+            if sell_quantity <= 0:
+                logger.warning(
+                    "Skip forced SELL %s because normalized quantity is too small. raw_qty=%.12f price=%.8f",
+                    pair,
+                    quantity,
+                    price,
+                )
+                continue
+
+            try:
+                ok = self.submit_market_order(pair, "SELL", sell_quantity, reason, -999.0, price)
+            except UnknownOrderStateError as exc:
+                logger.exception(
+                    "Forced SELL status unknown for %s. Continue exiting others. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "Forced SELL failed for %s. Continue exiting others. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+
+            if ok:
+                # 只有当本次卖单基本等于可卖持仓时，才移除 meta
                 if sell_quantity >= quantity * 0.999999:
                     self.remove_position_meta(pair)
-                    self.set_cooldown(pair, self.cfg.cooldown_minutes)
+                self.set_cooldown(pair, self.cfg.cooldown_minutes)
+
+    def reduce_positions(
+            self,
+            positions: Dict[str, float],
+            tickers: Dict[str, Any],
+            reason: str,
+            sell_fraction: float,
+    ) -> set[str]:
+        reduced_pairs: set[str] = set()
+        for pair, quantity in list(positions.items()):
+            if quantity <= 0:
+                continue
+
+            price = self.pair_price(pair, tickers)
+            if price <= 0:
+                logger.warning("Skip risk reduction SELL %s due to invalid price.", pair)
+                continue
+
+            sell_quantity = self.sell_quantity_for_fraction(pair, quantity, price, sell_fraction)
+            if sell_quantity <= 0:
+                continue
+
+            try:
+                ok = self.submit_market_order(pair, "SELL", sell_quantity, reason, -999.0, price)
+            except UnknownOrderStateError as exc:
+                logger.exception(
+                    "Risk reduction SELL status unknown for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "Risk reduction SELL failed for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+
+            if ok:
+                if sell_quantity >= quantity * 0.999999:
+                    self.remove_position_meta(pair)
                 else:
                     meta = self.position_meta(pair)
                     if meta is not None:
-                        meta.quantity = max(quantity - sell_quantity, 0.0)
+                        meta.quantity = quantity - sell_quantity
+                        meta.last_trade_ts = now_ms()
+                        meta.last_reason = reason
                         self.set_position_meta(meta)
-                    reduced_pairs.add(pair)
+                        reduced_pairs.add(pair)
+                self.set_cooldown(pair, self.cfg.cooldown_minutes)
         return reduced_pairs
 
     def rebalance_once(self) -> None:
         now = time.time()
 
-        # cooldown
-        cooldown_seconds = 300  # 5分钟（推荐）
-
-        if now - self.last_rebalance_ts < cooldown_seconds:
-            logger.info("Cooldown active, skipping rebalance.")
-            return
+        # 1. 每分钟都更新市场数据
         tickers = self.fetch_all_tickers()
         self.update_history(tickers)
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.capture_portfolio_state(portfolio, tickers)
+
         skip_trim_pairs: set[str] = set()
-        if portfolio.drawdown >= self.cfg.max_portfolio_drawdown:
-            logger.warning("Portfolio kill switch triggered.")
-            skip_trim_pairs = self.reduce_all_positions(
+        allow_new_entries = now_ms() >= self.state.portfolio_reentry_allowed_at
+        if portfolio.drawdown >= self.cfg.max_portfolio_drawdown and portfolio.positions:
+            logger.warning("Portfolio drawdown throttle triggered. Reduce risk and skip new buys this round.")
+            skip_trim_pairs |= self.reduce_positions(
                 portfolio.positions,
                 tickers,
                 "portfolio_drawdown",
-                0.50,
+                sell_fraction=0.50,
+            )
+            allow_new_entries = False
+            self.state.portfolio_reentry_allowed_at = max(
+                self.state.portfolio_reentry_allowed_at,
+                now_ms() + self.cfg.portfolio_drawdown_cooldown_minutes * 60_000,
             )
             portfolio = self.build_portfolio_snapshot(tickers)
             self.sync_position_meta(portfolio.positions, tickers)
@@ -970,21 +1431,76 @@ class RoostooMomentumBot:
         )
         self.state.risk_on = signals["risk_on"]
         self.log_signal_snapshot(signals)
+
         logger.info(
-            "Regime=%s risk=%.2f targets=%s",
+            "Regime=%s risk_on=%s overlay_regime=%s overlay_score=%.2f "
+            "target_exposure=%.2f port_vol=%.4f avg_corr=%.4f "
+            "mu_ready=%s mu_error=%s mu_blend=%s fixed_blend=%s "
+            "pre=%s final=%s",
             signals["regime"]["regime"],
-            signals["regime"]["risk_multiplier"],
-            signals["weights"]
+            signals["risk_on"],
+            signals["portfolio_risk"]["market_regime"],
+            signals["portfolio_risk"]["risk_score"],
+            signals["portfolio_risk"]["target_exposure"],
+            signals["portfolio_risk"]["portfolio_volatility"],
+            signals["portfolio_risk"]["average_correlation"],
+            signals["regime"].get("mu_ready"),
+            signals["regime"].get("mu_error"),
+            signals["regime"].get("mu_blend_weight"),
+            signals["regime"].get("fixed_blend_weight"),
+            signals.get("pre_risk_weights", {}),
+            signals.get("weights", {}),
         )
+
+        sample_pairs = list(signals.get("features", {}).items())[:5]
+        sample_mu = {
+            pair: {
+                "pred_mu": feat.get("pred_mu"),
+                "pred_mu_z": feat.get("pred_mu_z"),
+                "score": feat.get("score"),
+            }
+            for pair, feat in sample_pairs
+        }
+        logger.info("MU sample=%s", sample_mu)
 
         if not signals["features"]:
             logger.info("Not enough history yet.")
             self.persist_runtime_state()
-            self.last_rebalance_ts = now
             return
 
-        skip_trim_pairs.update(
-            self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
+        # warm up
+        warmup_remaining_ms = (
+            self.cfg.startup_warmup_minutes * 60_000
+            - (now_ms() - self.session_start_ts)
+        )
+        if warmup_remaining_ms > 0:
+            logger.info(
+                "Startup warmup active, skip orders only. Remaining %.1f min",
+                warmup_remaining_ms / 60_000,
+            )
+            self.persist_runtime_state()
+            return
+
+        # freshness gate
+        fresh_ok, fresh_reason = self.history_is_fresh_enough()
+        if not fresh_ok:
+            logger.info("Freshness gate active, skip orders only. %s", fresh_reason)
+            self.persist_runtime_state()
+            return
+
+        # trade cooldown
+        cooldown_seconds = self.cfg.cooldown_minutes * 60
+        if now - self.last_rebalance_ts < cooldown_seconds:
+            logger.info("Trading cooldown active, skip orders only.")
+            self.persist_runtime_state()
+            return
+
+        # 3. 真正下单
+        skip_trim_pairs |= self.manage_existing_positions(
+            portfolio.positions,
+            tickers,
+            signals["features"],
+            signals["weights"],
         )
 
         portfolio = self.build_portfolio_snapshot(tickers)
@@ -1001,7 +1517,21 @@ class RoostooMomentumBot:
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)
-        self.add_target_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
+        if allow_new_entries:
+            self.add_target_positions(
+                portfolio,
+                tickers,
+                signals["features"],
+                signals["weights"],
+                rebalance_threshold,
+            )
+        else:
+            remaining_ms = max(0, self.state.portfolio_reentry_allowed_at - now_ms())
+            logger.info(
+                "Skip new buys while portfolio drawdown cooldown is active. Remaining %.1f hours",
+                remaining_ms / 3_600_000,
+            )
+
         self.persist_runtime_state()
         self.last_rebalance_ts = now
 

@@ -51,6 +51,7 @@ class SimBacktestState:
     cooldown_until: Dict[str, int] = field(default_factory=dict)
     positions_meta: Dict[str, SimPositionMeta] = field(default_factory=dict)
     risk_on: bool = False
+    portfolio_reentry_allowed_at: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rebalance-minutes",
         type=int,
-        default=10,
-        help="Rebalance interval in minutes. Default: 10 to cap execution at most once every 10 minutes",
+        default=60,
+        help="Rebalance interval in minutes. Default: 60 to cap execution at most once every hour",
     )
     parser.add_argument(
         "--fee-rate",
@@ -410,7 +411,7 @@ def score_total_backtest(
 
     universe_ratio = executed_symbols / requested_symbols if requested_symbols > 0 else 0.0
     score_validity = clamp(universe_ratio * 5.0, 0.0, 5.0)
-    score_compliance = 5.0 if rebalance_minutes >= 10 else clamp(rebalance_minutes / 10.0 * 5.0, 0.0, 5.0)
+    score_compliance = 5.0 if rebalance_minutes >= 60 else clamp(rebalance_minutes / 60.0 * 5.0, 0.0, 5.0)
 
     total_score = clamp(
         score_base + score_return + score_risk_adjusted + score_drawdown + score_validity + score_compliance,
@@ -613,6 +614,12 @@ def in_cooldown(state: SimBacktestState, pair: str, ts_ms: int) -> bool:
     return ts_ms < state.cooldown_until.get(pair, 0)
 
 
+def unrealized_return(entry_price: float, price: float) -> float:
+    if entry_price <= 0 or price <= 0:
+        return 0.0
+    return price / entry_price - 1.0
+
+
 def run_backtest(
     cfg: Config,
     market_data: Dict[str, pd.DataFrame],
@@ -665,8 +672,14 @@ def run_backtest(
 
         if step > 0 and step % rebalance_minutes == 0:
             skip_trim_pairs: set[str] = set()
+            allow_new_buys = ts_ms >= state.portfolio_reentry_allowed_at
             drawdown = 1.0 - (equity_before_rebalance / state.peak_equity) if state.peak_equity > 0 else 0.0
-            if drawdown >= cfg.max_portfolio_drawdown:
+            if drawdown >= cfg.max_portfolio_drawdown and quantities:
+                allow_new_buys = False
+                state.portfolio_reentry_allowed_at = max(
+                    state.portfolio_reentry_allowed_at,
+                    ts_ms + cfg.portfolio_drawdown_cooldown_minutes * 60_000,
+                )
                 for pair, quantity in list(quantities.items()):
                     price = current_prices.get(pair, 0.0)
                     market_row = current_market.get(pair)
@@ -745,12 +758,22 @@ def run_backtest(
                     meta = build_position_meta(state, pair, quantity, price, score, ts_ms)
                     reasons = exit_reasons(cfg, pair, meta, price, score, target_weights)
                     if reasons:
+                        current_return = unrealized_return(meta.entry_price, price)
+                        protected_profit = current_return >= cfg.profit_protect_threshold
                         if "stop_loss" in reasons or "trailing_stop" in reasons:
                             sell_fraction = 1.0
                         elif "not_in_targets" in reasons:
-                            sell_fraction = 0.50
+                            sell_fraction = (
+                                cfg.profit_protect_not_in_targets_fraction
+                                if protected_profit
+                                else 0.30
+                            )
                         else:
-                            sell_fraction = 0.35
+                            sell_fraction = (
+                                cfg.profit_protect_score_decay_fraction
+                                if protected_profit
+                                else 0.25
+                            )
                         sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, sell_fraction)
                         if sell_quantity <= 0:
                             state.positions_meta[pair] = meta
@@ -877,6 +900,8 @@ def run_backtest(
                 threshold = rebalance_notional_threshold(cfg, portfolio_equity)
                 notional_map = current_notional(quantities, current_prices)
                 for pair, weight in sorted(target_weights.items(), key=lambda item: item[1], reverse=True):
+                    if not allow_new_buys:
+                        break
                     if in_cooldown(state, pair, ts_ms):
                         continue
                     price = current_prices.get(pair, 0.0)
@@ -1013,6 +1038,92 @@ def summarize_run(
     return pd.DataFrame(rows)
 
 
+def save_equity_plot(equity_curve: pd.DataFrame, output_path: Path) -> None:
+    if equity_curve.empty:
+        return
+
+    plot_frame = equity_curve.copy()
+    plot_frame["ts"] = pd.to_datetime(plot_frame["ts"], utc=True, errors="coerce")
+    plot_frame = plot_frame.dropna(subset=["ts"]).copy()
+    if plot_frame.empty:
+        return
+
+    plot_frame["position_value"] = plot_frame["equity"] - plot_frame["cash"]
+    series = {
+        "Total Equity": ("#16324f", plot_frame["equity"].astype(float).tolist()),
+        "Cash": ("#2a9d8f", plot_frame["cash"].astype(float).tolist()),
+        "Position Value": ("#e76f51", plot_frame["position_value"].astype(float).tolist()),
+    }
+
+    values = [value for _label, (_color, data) in series.items() for value in data]
+    if not values:
+        return
+
+    min_value = min(values)
+    max_value = max(values)
+    if math.isclose(min_value, max_value):
+        min_value -= 1.0
+        max_value += 1.0
+
+    width = 1400
+    height = 760
+    left = 90
+    right = 30
+    top = 50
+    bottom = 80
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    count = max(len(plot_frame) - 1, 1)
+
+    def x_pos(index: int) -> float:
+        return left + plot_width * index / count
+
+    def y_pos(value: float) -> float:
+        scaled = (value - min_value) / (max_value - min_value)
+        return top + plot_height * (1.0 - scaled)
+
+    grid_lines = []
+    y_labels = []
+    for idx in range(6):
+        value = min_value + (max_value - min_value) * idx / 5
+        y = y_pos(value)
+        grid_lines.append(f"<line x1='{left}' y1='{y:.2f}' x2='{width - right}' y2='{y:.2f}' stroke='#d9dee5' stroke-width='1' />")
+        y_labels.append(f"<text x='{left - 10}' y='{y + 4:.2f}' font-size='12' text-anchor='end' fill='#425466'>{value:,.0f}</text>")
+
+    x_labels = []
+    for idx in range(5):
+        point_idx = round((len(plot_frame) - 1) * idx / 4) if len(plot_frame) > 1 else 0
+        x = x_pos(point_idx)
+        ts_label = plot_frame.iloc[point_idx]["ts"].strftime("%Y-%m-%d")
+        x_labels.append(f"<text x='{x:.2f}' y='{height - 28}' font-size='12' text-anchor='middle' fill='#425466'>{ts_label}</text>")
+
+    paths = []
+    legend = []
+    legend_y = 24
+    legend_x = left
+    offset = 0
+    for label, (color, data) in series.items():
+        points = " ".join(f"{x_pos(idx):.2f},{y_pos(value):.2f}" for idx, value in enumerate(data))
+        paths.append(f"<polyline fill='none' stroke='{color}' stroke-width='2.5' points='{points}' />")
+        legend.append(f"<line x1='{legend_x + offset}' y1='{legend_y}' x2='{legend_x + offset + 18}' y2='{legend_y}' stroke='{color}' stroke-width='3' />")
+        legend.append(f"<text x='{legend_x + offset + 24}' y='{legend_y + 4}' font-size='13' fill='#1f2933'>{label}</text>")
+        offset += 180
+
+    svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>
+<rect width='100%' height='100%' fill='#ffffff' />
+<text x='{left}' y='28' font-size='20' font-weight='700' fill='#0f172a'>Backtest Asset Curve</text>
+<text x='{left}' y='46' font-size='12' fill='#51606f'>Total equity = cash + position value</text>
+{''.join(grid_lines)}
+<line x1='{left}' y1='{top}' x2='{left}' y2='{height - bottom}' stroke='#6b7280' stroke-width='1.2' />
+<line x1='{left}' y1='{height - bottom}' x2='{width - right}' y2='{height - bottom}' stroke='#6b7280' stroke-width='1.2' />
+{''.join(paths)}
+{''.join(y_labels)}
+{''.join(x_labels)}
+{''.join(legend)}
+</svg>"""
+    output_path.write_text(svg, encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     end_date = date.fromisoformat(args.end_date)
@@ -1083,10 +1194,12 @@ def main() -> None:
     summary_path = run_dir / f"summary_{stamp}.csv"
     equity_path = run_dir / f"equity_curve_{stamp}.csv"
     trades_path = run_dir / f"trades_{stamp}.csv"
+    equity_plot_path = run_dir / f"equity_curve_{stamp}.svg"
 
     summary.to_csv(summary_path, index=False)
     equity_curve.to_csv(equity_path, index=False)
     trades.to_csv(trades_path, index=False)
+    save_equity_plot(equity_curve, equity_plot_path)
 
     print("Backtest completed.")
     print(f"Roostoo pairs: {', '.join(available_pair_to_symbol)}")
@@ -1105,9 +1218,10 @@ def main() -> None:
     print(f"Summary CSV: {summary_path}")
     print(f"Equity CSV: {equity_path}")
     print(f"Trades CSV: {trades_path}")
+    print(f"Equity Plot: {equity_plot_path}")
     print()
     print("Note: this backtest now aligns the universe and initial wallet to Roostoo exchangeInfo,")
-    print("maps Roostoo /USD pairs to Binance USDT spot aggTrades, and enforces max 1 rebalance every 10 minutes by default.")
+    print("maps Roostoo /USD pairs to Binance USDT spot aggTrades, and enforces max 1 rebalance every hour by default.")
 
 
 if __name__ == "__main__":
