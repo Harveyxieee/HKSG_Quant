@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -121,13 +121,13 @@ def load_price_data(
 
     price_df = pd.concat(series_map, axis=1).sort_index()
     if frequency == "auto":
-        for label, rule in [("daily", "1D"), ("hourly", "1H"), ("raw", None)]:
+        for label, rule in [("daily", "1D"), ("hourly", "1h"), ("raw", None)]:
             candidate = _resample_price_frame(price_df, rule)
             if len(candidate) >= min_periods:
                 return candidate, label
         return _resample_price_frame(price_df, None), "raw"
 
-    mapping = {"daily": "1D", "hourly": "1H", "raw": None}
+    mapping = {"daily": "1D", "hourly": "1h", "raw": None}
     selected = _resample_price_frame(price_df, mapping.get(frequency, None))
     return selected, frequency if frequency in mapping else "raw"
 
@@ -399,23 +399,21 @@ class RegimeFilter:
 
     def sync_symbols(self, symbols: List[str]) -> None:
         """
-        universe 变化时保留已有 symbol 的历史，只增删映射，不整对象重建。
-        """
+        universe 鍙樺寲鏃朵繚鐣欏凡鏈?symbol 鐨勫巻鍙诧紝鍙鍒犳槧灏勶紝涓嶆暣瀵硅薄閲嶅缓銆?        """
         new_symbols = list(symbols)
         new_set = set(new_symbols)
         old_set = set(self.price_history.keys())
 
-        # 新增 symbol：创建新 deque
+        # 鏂板 symbol锛氬垱寤烘柊 deque
         for symbol in new_symbols:
             if symbol not in self.price_history:
                 self.price_history[symbol] = deque(maxlen=self.maxlen)
 
-        # 删除不再需要的 symbol
+        # 鍒犻櫎涓嶅啀闇€瑕佺殑 symbol
         for symbol in list(old_set - new_set):
             self.price_history.pop(symbol, None)
 
-        # 保持迭代顺序与当前 universe 一致
-        self.symbols = new_symbols
+        # 淇濇寔杩唬椤哄簭涓庡綋鍓?universe 涓€鑷?        self.symbols = new_symbols
         self.price_history = {symbol: self.price_history[symbol] for symbol in self.symbols}
 
     def update_market_data(self, tickers: Dict[str, Dict[str, float]]) -> None:
@@ -625,13 +623,13 @@ class MomentumStrategy:
         )
 
         # --- turnover reduction / less aggressive sell ---
-        self.rank_retention_buffer = 0.18
-        self.holding_bonus_floor = 0.22
+        self.rank_retention_buffer = 0.25
+        self.holding_bonus_floor = 0.30
 
         # anti-chase for new entries
-        self.pump_chase_cutoff = 0.035
-        self.pullback_entry_floor = -0.025
-        self.range_keep_exposure = 0.30
+        self.pump_chase_cutoff = 0.025
+        self.pullback_entry_floor = -0.020
+        self.range_keep_exposure = 0.25
         self.risk_exposure_haircut = 0.60
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
@@ -714,8 +712,7 @@ class MomentumStrategy:
             quote_volume_z20 = zscore(current_quote_volume, quote_volume_values) if len(
                 quote_volume_values) >= 2 else 0.0
 
-            # 当前 Roostoo history 里没有独立 quote_volume / trades 字段，
-            # 暂时用 unit_trade_value 代理 quote_volume，trades 先设为 0
+            # 褰撳墠 Roostoo history 閲屾病鏈夌嫭绔?quote_volume / trades 瀛楁锛?            # 鏆傛椂鐢?unit_trade_value 浠ｇ悊 quote_volume锛宼rades 鍏堣涓?0
             quote_volume_z20 = volume_z20
             trades_z20 = 0.0
 
@@ -909,7 +906,7 @@ class MomentumStrategy:
             if pair in selected_pairs:
                 continue
 
-            # 已有持仓只要没明显掉出 cutoff，就允许保留
+            # 宸叉湁鎸佷粨鍙娌℃槑鏄炬帀鍑?cutoff锛屽氨鍏佽淇濈暀
             if ranking_score >= cutoff_score - self.rank_retention_buffer:
                 selected.append(item)
                 selected_pairs.add(pair)
@@ -943,24 +940,22 @@ class MomentumStrategy:
                 ret5 = feature.get("ret5", 0.0)
                 ret15 = feature.get("ret15", 0.0)
 
-                # 涨太快、离均线太远：不追
+                # avoid chasing extended breakouts
                 if dist_ma20 > self.pump_chase_cutoff:
                     continue
                 if ret5 > self.pump_chase_cutoff or ret15 > self.pump_chase_cutoff * 1.5:
                     continue
 
-                # 回撤太深也不接
+                # avoid catching overly deep pullbacks
                 if pullback20 < self.pullback_entry_floor:
                     continue
-
-            # --- holding retention bonus ---
             holding_bonus = 0.0
             if is_held:
                 holding_bonus = max(self.cfg.holding_score_bonus, self.holding_bonus_floor)
 
             ranking_score = score + holding_bonus
 
-            # 对新仓再加一点“别追涨”的软惩罚，而不是只靠硬过滤
+            # 瀵规柊浠撳啀鍔犱竴鐐光€滃埆杩芥定鈥濈殑杞儵缃氾紝鑰屼笉鏄彧闈犵‖杩囨护
             if not is_held:
                 if feature.get("dist_ma20", 0.0) > self.pump_chase_cutoff * 0.6:
                     ranking_score -= 0.12
@@ -994,7 +989,7 @@ class MomentumStrategy:
                 1.55,
             )
 
-            # 已持仓再给一点强度保护，减少被 trim / replace
+            # 宸叉寔浠撳啀缁欎竴鐐瑰己搴︿繚鎶わ紝鍑忓皯琚?trim / replace
             if pair in held_pairs:
                 quality_multiplier *= 1.08
 
@@ -1010,9 +1005,7 @@ class MomentumStrategy:
         history: Dict[str, Deque[Dict[str, float]]],
     ) -> Dict[str, float]:
         """
-        用于在没有新 target，或者需要给风险层一个“现有仓位结构”输入时，
-        构造一个稳定的权重代理。
-        """
+        鐢ㄤ簬鍦ㄦ病鏈夋柊 target锛屾垨鑰呴渶瑕佺粰椋庨櫓灞備竴涓€滅幇鏈変粨浣嶇粨鏋勨€濊緭鍏ユ椂锛?        鏋勯€犱竴涓ǔ瀹氱殑鏉冮噸浠ｇ悊銆?        """
         if not positions:
             return {}
 
@@ -1027,7 +1020,7 @@ class MomentumStrategy:
                 score = max(feature.get("score", 0.0), 0.0)
                 strength = max(0.05, (0.30 + score) / vol)
             else:
-                # 没 feature 时退化成等权强度
+                # 娌?feature 鏃堕€€鍖栨垚绛夋潈寮哄害
                 strength = 1.0
 
             strengths.append((pair, strength))
@@ -1044,8 +1037,7 @@ class MomentumStrategy:
         history: Dict[str, Deque[Dict[str, float]]],
     ) -> Dict[str, float]:
         """
-        range 环境下不直接清空，而是给现有持仓一个较小总暴露的保留权重。
-        """
+        range 鐜涓嬩笉鐩存帴娓呯┖锛岃€屾槸缁欑幇鏈夋寔浠撲竴涓緝灏忔€绘毚闇茬殑淇濈暀鏉冮噸銆?        """
         base = self._position_weight_proxy(positions, features, history)
         if not base:
             return {}
@@ -1112,12 +1104,7 @@ class MomentumStrategy:
             raw_weights: Dict[str, float],
             positions: Dict[str, float],
     ) -> PortfolioRiskState:
-        universe = self._build_risk_universe(
-            history=history,
-            trade_pairs=trade_pairs,
-            raw_weights=raw_weights,
-            positions=positions,
-        )
+        universe = self._build_risk_universe(history, trade_pairs, raw_weights, positions)
         risk_frequency = self.cfg.risk_data_frequency
         if risk_frequency in ("auto", "raw"):
             risk_frequency = "hourly"
@@ -1131,13 +1118,12 @@ class MomentumStrategy:
         returns_df = compute_returns(price_df, method=self.cfg.risk_return_method)
 
         conservative_exposure = (
-                self.cfg.neutral_exposure_multiplier
-                * self.cfg.target_gross_exposure
-                * self.risk_exposure_haircut
+            self.cfg.neutral_exposure_multiplier
+            * self.cfg.target_gross_exposure
+            * self.risk_exposure_haircut
         )
-
-        # 样本太少时，直接给一个保守但可运行的默认风险状态
-        if returns_df.shape[0] < max(20, self.cfg.risk_cov_window // 2):
+        minimum_samples = max(20, self.cfg.risk_cov_window // 2)
+        if returns_df.shape[0] < minimum_samples:
             return PortfolioRiskState(
                 covariance_matrix={},
                 portfolio_volatility=0.0,
@@ -1155,23 +1141,44 @@ class MomentumStrategy:
             returns_df,
             min_samples_per_asset=max(20, self.cfg.risk_cov_window // 2),
             min_periods_pairwise=max(10, self.cfg.risk_cov_window // 3),
+            shrinkage=0.25,
         )
         logger.info(
             "Risk matrix: returns_shape=%s cov_shape=%s",
             tuple(returns_df.shape) if not returns_df.empty else (0, 0),
             tuple(cov_matrix.shape) if not cov_matrix.empty else (0, 0),
         )
+        if cov_matrix.shape[0] < 2:
+            return PortfolioRiskState(
+                covariance_matrix=cov_matrix.round(8).to_dict() if not cov_matrix.empty else {},
+                portfolio_volatility=0.0,
+                average_correlation=0.0,
+                market_regime="neutral",
+                risk_score=0.5,
+                target_exposure=conservative_exposure,
+                diversification_breakdown=False,
+                data_frequency=data_frequency,
+                raw_weights=raw_weights,
+                adjusted_weights=raw_weights,
+            )
 
         weight_proxy = raw_weights or self._position_weight_proxy(positions, features, history)
         if not weight_proxy and not cov_matrix.empty:
             equal_weight = self.cfg.target_gross_exposure / max(len(cov_matrix.columns), 1)
             weight_proxy = {pair: equal_weight for pair in cov_matrix.columns}
+        weight_proxy = {
+            pair: weight
+            for pair, weight in weight_proxy.items()
+            if pair in cov_matrix.columns and weight > 0
+        }
 
         portfolio_volatility = compute_portfolio_volatility(weight_proxy, cov_matrix)
         average_correlation = compute_average_correlation(
             returns_df=returns_df,
             cov_matrix=cov_matrix,
             window=self.cfg.risk_cov_window,
+            min_samples_per_asset=max(10, self.cfg.risk_cov_window // 3),
+            min_periods_pairwise=max(8, self.cfg.risk_cov_window // 4),
         )
         diversification_breakdown = check_diversification_breakdown(
             average_correlation=average_correlation,
@@ -1200,6 +1207,8 @@ class MomentumStrategy:
             diversification_breakdown=diversification_breakdown,
             portfolio_volatility=portfolio_volatility,
         )
+        if len(weight_proxy) < 2:
+            target_exposure *= self.risk_exposure_haircut
 
         return PortfolioRiskState(
             covariance_matrix=cov_matrix.round(8).to_dict() if not cov_matrix.empty else {},
@@ -1256,18 +1265,15 @@ class MomentumStrategy:
 
         regime_name = regime["regime"]
 
-        # 第一层：只做方向过滤，不做仓位缩放
-        # trend / neutral 允许开新仓；range / panic 不开新仓
+        # first layer: direction filter only; trend/neutral can open new positions
         allow_new_entries = (
-                regime_name in ["trend", "neutral"]
-                and self.risk_on(snapshot, prev_risk_on)
+            regime_name in ["trend", "neutral"]
+            and self.risk_on(snapshot, prev_risk_on)
         )
 
-        # 原始方向层目标权重：这里只表达“想买谁”，不表达最终总仓位
         raw_weights = self.target_weights(features, allow_new_entries, positions)
 
-        # 如果处于 range / panic，不开新仓；
-        # 但如果已经有持仓，则保留现有持仓作为风险层输入，让第二层决定缩多少仓
+        # range/panic should not open new positions; keep only retained risk exposure when needed
         if regime_name == "range":
             if positions:
                 raw_weights = self._range_keep_weights(positions, features, history)
@@ -1276,7 +1282,7 @@ class MomentumStrategy:
         elif regime_name == "panic":
             raw_weights = {}
 
-        # 第二层：只负责风险覆盖与仓位缩放
+        # 绗簩灞傦細鍙礋璐ｉ闄╄鐩栦笌浠撲綅缂╂斁
         portfolio_risk = self.evaluate_portfolio_risk(
             history=history,
             trade_pairs=trade_pairs,
@@ -1285,11 +1291,10 @@ class MomentumStrategy:
             positions=positions,
         )
 
-        # 最终 risk_on 只表示“是否允许新增风险”
-        # risk_off 时不新增；range / panic 时也不新增
+        # final risk_on only controls whether new risk can be added
         risk_on = allow_new_entries and portfolio_risk.market_regime != "risk_off"
 
-        # 第二层先调结构，再统一缩放总 exposure
+        # risk layer adjusts structure first, then rescales total exposure
         final_weights = portfolio_risk.adjusted_weights or raw_weights
         if final_weights:
             total = sum(final_weights.values())
@@ -1300,7 +1305,6 @@ class MomentumStrategy:
                 }
             else:
                 final_weights = {}
-
         return {
             "features": features,
             "snapshot": snapshot,
@@ -1327,3 +1331,5 @@ class MomentumStrategy:
                 "mu_error": self.mu_model.error,
             },
         }
+
+

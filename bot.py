@@ -130,15 +130,15 @@ class Config:
             portfolio_log_csv=log_dir / "portfolio.csv",
             signal_log_csv=log_dir / "signals.csv",
             top_n=int(os.getenv("TOP_N", "3")),
-            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.78")),
+            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.72")),
             max_single_weight=float(os.getenv("MAX_SINGLE_WEIGHT", "0.28")),
-            cash_buffer=float(os.getenv("CASH_BUFFER", "0.20")),
-            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.60")),
+            cash_buffer=float(os.getenv("CASH_BUFFER", "0.25")),
+            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.70")),
             exit_score_threshold=float(os.getenv("EXIT_SCORE_THRESHOLD", "0.12")),
-            rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.03")),
-            min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "25")),
+            rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.05")),
+            min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "40")),
             spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.006")),
-            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "50000")),
+            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "150000")),
             max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.05")),
             market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0005")),
             market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.52")),
@@ -148,7 +148,7 @@ class Config:
             regime_exit_positive_score_ratio_threshold=float(os.getenv("REGIME_EXIT_POSITIVE_SCORE_RATIO_THRESHOLD", "0.42")),
             vol_floor=float(os.getenv("VOL_FLOOR", "0.004")),
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
-            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.08")),
+            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.14")),
             per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.035")),
             risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "raw").strip().lower(),
             risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "60")),
@@ -191,7 +191,7 @@ class Config:
             ),
             per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.045")),
             max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
-            cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
+            cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "60")),
             startup_warmup_minutes=int(os.getenv("STARTUP_WARMUP_MINUTES", "30")),
             max_data_delay_minutes=int(os.getenv("MAX_DATA_DELAY_MINUTES", "2")),
             min_fresh_points_after_start=int(os.getenv("MIN_FRESH_POINTS_AFTER_START", "30")),
@@ -970,7 +970,8 @@ class RoostooMomentumBot:
             tickers: Dict[str, Any],
             features: Dict[str, Dict[str, float]],
             targets: Dict[str, float],
-    ) -> None:
+    ) -> set[str]:
+        skip_trim_pairs: set[str] = set()
         for pair, quantity in list(positions.items()):
             price = self.pair_price(pair, tickers)
             if price <= 0:
@@ -1063,7 +1064,16 @@ class RoostooMomentumBot:
             reasons = self.exit_reasons(pair, meta, price, score, targets)
 
             if reasons:
-                sell_quantity = self.sell_quantity_for_position(pair, quantity, price)
+                if "stop_loss" in reasons or "trailing_stop" in reasons:
+                    sell_fraction = 1.0
+                elif "not_in_targets" in reasons:
+                    sell_fraction = 0.30
+                else:
+                    sell_fraction = 0.25
+                sell_quantity = min(
+                    self.sell_quantity_for_position(pair, quantity, price),
+                    quantity * sell_fraction,
+                )
                 if sell_quantity <= 0:
                     logger.info(
                         "Skip SELL %s because normalized quantity is too small. raw_qty=%.12f",
@@ -1107,12 +1117,19 @@ class RoostooMomentumBot:
                 if ok:
                     if sell_quantity >= quantity * 0.999999:
                         self.remove_position_meta(pair)
+                    elif sell_fraction < 1.0:
+                        meta.quantity = quantity - sell_quantity
+                        meta.last_trade_ts = now_ms()
+                        meta.last_reason = "+".join(reasons)
+                        self.set_position_meta(meta)
+                        skip_trim_pairs.add(pair)
                     self.set_cooldown(pair, self.cfg.cooldown_minutes)
                 else:
                     self.set_position_meta(meta)
                 continue
 
             self.set_position_meta(meta)
+        return skip_trim_pairs
 
     def trim_positions(
             self,
@@ -1121,8 +1138,12 @@ class RoostooMomentumBot:
             features: Dict[str, Dict[str, float]],
             targets: Dict[str, float],
             rebalance_threshold: float,
+            skip_pairs: Optional[set[str]] = None,
     ) -> None:
+        skip_pairs = skip_pairs or set()
         for pair, quantity in list(portfolio.positions.items()):
+            if pair in skip_pairs:
+                continue
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
@@ -1291,6 +1312,61 @@ class RoostooMomentumBot:
                     self.remove_position_meta(pair)
                 self.set_cooldown(pair, self.cfg.cooldown_minutes)
 
+    def reduce_positions(
+            self,
+            positions: Dict[str, float],
+            tickers: Dict[str, Any],
+            reason: str,
+            sell_fraction: float,
+    ) -> set[str]:
+        reduced_pairs: set[str] = set()
+        for pair, quantity in list(positions.items()):
+            if quantity <= 0:
+                continue
+
+            price = self.pair_price(pair, tickers)
+            if price <= 0:
+                logger.warning("Skip risk reduction SELL %s due to invalid price.", pair)
+                continue
+
+            raw_sell_qty = quantity * sell_fraction
+            sell_quantity = self.sell_quantity_for_position(pair, raw_sell_qty, price)
+            if sell_quantity <= 0:
+                continue
+
+            try:
+                ok = self.submit_market_order(pair, "SELL", sell_quantity, reason, -999.0, price)
+            except UnknownOrderStateError as exc:
+                logger.exception(
+                    "Risk reduction SELL status unknown for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "Risk reduction SELL failed for %s. qty=%.12f err=%s",
+                    pair,
+                    sell_quantity,
+                    exc,
+                )
+                continue
+
+            if ok:
+                if sell_quantity >= quantity * 0.999999:
+                    self.remove_position_meta(pair)
+                else:
+                    meta = self.position_meta(pair)
+                    if meta is not None:
+                        meta.quantity = quantity - sell_quantity
+                        meta.last_trade_ts = now_ms()
+                        meta.last_reason = reason
+                        self.set_position_meta(meta)
+                        reduced_pairs.add(pair)
+                self.set_cooldown(pair, self.cfg.cooldown_minutes)
+        return reduced_pairs
+
     def rebalance_once(self) -> None:
         now = time.time()
 
@@ -1301,12 +1377,19 @@ class RoostooMomentumBot:
         portfolio = self.build_portfolio_snapshot(tickers)
         self.capture_portfolio_state(portfolio, tickers)
 
+        skip_trim_pairs: set[str] = set()
+        allow_new_entries = True
         if portfolio.drawdown >= self.cfg.max_portfolio_drawdown:
-            logger.warning("Portfolio kill switch triggered.")
-            self.exit_all_positions(portfolio.positions, tickers, "portfolio_drawdown")
-            self.persist_runtime_state()
-            self.last_rebalance_ts = now
-            return
+            logger.warning("Portfolio drawdown throttle triggered. Reduce risk and skip new buys this round.")
+            skip_trim_pairs |= self.reduce_positions(
+                portfolio.positions,
+                tickers,
+                "portfolio_drawdown",
+                sell_fraction=0.50,
+            )
+            allow_new_entries = False
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.sync_position_meta(portfolio.positions, tickers)
 
         signals = self.strategy.generate_signals(
             history=self.history,
@@ -1381,16 +1464,37 @@ class RoostooMomentumBot:
             return
 
         # 3. 真正下单
-        self.manage_existing_positions(portfolio.positions, tickers, signals["features"], signals["weights"])
+        skip_trim_pairs |= self.manage_existing_positions(
+            portfolio.positions,
+            tickers,
+            signals["features"],
+            signals["weights"],
+        )
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)
         rebalance_threshold = self.rebalance_notional_threshold(portfolio.equity)
-        self.trim_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
+        self.trim_positions(
+            portfolio,
+            tickers,
+            signals["features"],
+            signals["weights"],
+            rebalance_threshold,
+            skip_pairs=skip_trim_pairs,
+        )
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.sync_position_meta(portfolio.positions, tickers)
-        self.add_target_positions(portfolio, tickers, signals["features"], signals["weights"], rebalance_threshold)
+        if allow_new_entries:
+            self.add_target_positions(
+                portfolio,
+                tickers,
+                signals["features"],
+                signals["weights"],
+                rebalance_threshold,
+            )
+        else:
+            logger.info("Skip new buys after portfolio drawdown reduction in this rebalance round.")
 
         self.persist_runtime_state()
         self.last_rebalance_ts = now
