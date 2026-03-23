@@ -765,7 +765,7 @@ class RoostooMomentumBot:
         if not response.get("Success", False):
             raise RuntimeError(f"Balance fetch failed: {response}")
         wallet: Dict[str, Dict[str, float]] = {}
-        for coin, value in response.get("Wallet", {}).items():
+        for coin, value in response.get("SpotWallet", {}).items():
             wallet[coin] = {"Free": safe_float(value.get("Free")), "Lock": safe_float(value.get("Lock"))}
         logger.info("PARSED WALLET: %s", wallet)
         return wallet
