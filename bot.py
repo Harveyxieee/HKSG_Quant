@@ -177,8 +177,8 @@ class Config:
         log_dir = data_dir / "logs"
         return cls(
             base_url=os.getenv("ROOSTOO_BASE_URL", "https://mock-api.roostoo.com").rstrip("/"),
-            api_key=os.getenv("ROOSTOO_API_KEY", "YZJpIGyMhk1efgdP8qZM0LTZZ2eFJh35ovWByPgSG73XS5OeWruM8XygCqHypBK7"),
-            api_secret=os.getenv("ROOSTOO_API_SECRET", "PTtlKF7Vwed7MfiUCz6G6PySVDH5zP8Vjz4lmIYuxQyrjq5EvseYAJV3jAhVnYyK"),
+            api_key=os.getenv("ROOSTOO_API_KEY", "zx1oEdatzBZf1jklzkJ5F6zDf2RiNKvX3ONQchbPeYj6mxo1kSjUadOb9pzrKElw"),
+            api_secret=os.getenv("ROOSTOO_API_SECRET", "kgRYJVTWrhpsD41vtE3z1aKNfOSaRayw99nSvQkLNjHMfV6O6z1wTDouPWZvmRAh"),
             bot_name=os.getenv("BOT_NAME", "roostoo_prelim_bot"),
             poll_seconds=int(os.getenv("POLL_SECONDS", "60")),
             lookback_minutes=int(os.getenv("LOOKBACK_MINUTES", "360")),
@@ -281,7 +281,7 @@ class Config:
             order_failure_pause_seconds=int(os.getenv("ORDER_FAILURE_PAUSE_SECONDS", "180")),
             loop_error_backoff_cap_seconds=int(os.getenv("LOOP_ERROR_BACKOFF_CAP_SECONDS", "900")),
             cancel_all_on_start=env_bool("CANCEL_ALL_ON_START", False),
-            dry_run=env_bool("DRY_RUN", True),
+            dry_run=env_bool("DRY_RUN", False),
             max_turnover_per_rebalance=float(os.getenv("MAX_TURNOVER_PER_REBALANCE", "0.60")),
             range_entry_exposure=float(os.getenv("RANGE_ENTRY_EXPOSURE", "0.12")),
             range_keep_exposure=float(os.getenv("RANGE_KEEP_EXPOSURE", "0.10")),
@@ -764,7 +764,7 @@ class RoostooMomentumBot:
         if not response.get("Success", False):
             raise RuntimeError(f"Balance fetch failed: {response}")
         wallet: Dict[str, Dict[str, float]] = {}
-        for coin, value in response.get("SpotWallet", {}).items():
+        for coin, value in response.get("Wallet", {}).items():
             wallet[coin] = {"Free": safe_float(value.get("Free")), "Lock": safe_float(value.get("Lock"))}
         return wallet
 
