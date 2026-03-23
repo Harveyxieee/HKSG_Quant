@@ -43,6 +43,8 @@ class SimPositionMeta:
     last_trade_ts: int
     last_signal_score: float
     last_reason: str = ""
+    recovery_trade_day: str = ""
+    entry_day: str = ""
 
 
 @dataclass
@@ -52,6 +54,10 @@ class SimBacktestState:
     positions_meta: Dict[str, SimPositionMeta] = field(default_factory=dict)
     risk_on: bool = False
     portfolio_reentry_allowed_at: int = 0
+    recovery_entries_by_day: Dict[str, int] = field(default_factory=dict)
+    trades_by_day: Dict[str, int] = field(default_factory=dict)
+    soft_trades_by_day: Dict[str, int] = field(default_factory=dict)
+    buy_trades_by_day: Dict[str, int] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +99,12 @@ def parse_args() -> argparse.Namespace:
         help="Rebalance interval in minutes. Default: 60 to cap execution at most once every hour",
     )
     parser.add_argument(
+        "--risk-check-minutes",
+        type=int,
+        default=15,
+        help="Risk-check interval in minutes. Default: 15 for stop-loss and drawdown checks between full rebalances",
+    )
+    parser.add_argument(
         "--fee-rate",
         type=float,
         default=0.001,
@@ -112,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         "--roostoo-base-url",
         default=ROOSTOO_BASE_URL,
         help="Roostoo API base URL used to fetch exchangeInfo. Default: https://mock-api.roostoo.com",
+    )
+    parser.add_argument(
+        "--exchange-info-cache",
+        default="data/roostoo_exchange_info.json",
+        help="Local cache for Roostoo exchangeInfo used for offline backtests.",
     )
     return parser.parse_args()
 
@@ -192,6 +209,33 @@ def fetch_roostoo_exchange_info(base_url: str) -> Dict[str, Any]:
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Failed to fetch exchange info from {url}")
+
+
+def load_exchange_info_cache(cache_path: Path) -> Dict[str, Any]:
+    return json.loads(cache_path.read_text(encoding="utf-8"))
+
+
+def save_exchange_info_cache(cache_path: Path, exchange_info: Dict[str, Any]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(exchange_info, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def build_synthetic_exchange_info(symbols_arg: str, initial_equity: float | None) -> Dict[str, Any]:
+    requested = [item.strip().upper() for item in symbols_arg.split(",") if item.strip()]
+    if not requested:
+        raise RuntimeError("Synthetic exchangeInfo requires --symbols to be provided.")
+    trade_pairs: Dict[str, Dict[str, Any]] = {}
+    for item in requested:
+        pair = item if "/" in item else pair_from_symbol(item)
+        trade_pairs[pair] = {
+            "CanTrade": True,
+            "AmountPrecision": 6,
+            "MiniOrder": 1.0,
+        }
+    return {
+        "TradePairs": trade_pairs,
+        "InitialWallet": {"USD": float(initial_equity) if initial_equity is not None else 1_000_000.0},
+    }
 
 
 def resolve_roostoo_universe(symbols_arg: str, exchange_info: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
@@ -341,7 +385,7 @@ def build_history_buffers(
     return history, pair_to_symbol
 
 
-def calculate_metrics(equity_curve: pd.DataFrame, rebalance_returns: List[float]) -> Dict[str, float]:
+def calculate_metrics(equity_curve: pd.DataFrame, trades: pd.DataFrame, rebalance_returns: List[float]) -> Dict[str, float]:
     if equity_curve.empty:
         return {}
 
@@ -370,6 +414,14 @@ def calculate_metrics(equity_curve: pd.DataFrame, rebalance_returns: List[float]
 
     winning_rebalances = sum(1 for value in rebalance_returns if value > 0)
     win_rate = winning_rebalances / len(rebalance_returns) if rebalance_returns else 0.0
+    avg_equity = float(equity.mean()) if len(equity) else 0.0
+    turnover = float(trades["turnover"].sum() / avg_equity) if avg_equity > 0 and not trades.empty and "turnover" in trades else 0.0
+    avg_gross_exposure = float(equity_curve["gross_exposure"].mean()) if "gross_exposure" in equity_curve else 0.0
+    avg_target_exposure = float(equity_curve["target_exposure"].mean()) if "target_exposure" in equity_curve else 0.0
+    exposure_time = float((equity_curve["gross_exposure"] > 0.05).mean()) if "gross_exposure" in equity_curve else 0.0
+    realized_sells = trades[trades["side"] == "SELL"] if not trades.empty and "side" in trades else pd.DataFrame()
+    hit_ratio = float((realized_sells["realized_pnl"] > 0).mean()) if not realized_sells.empty and "realized_pnl" in realized_sells else 0.0
+    avg_slippage_bps = float(trades["slippage_bps"].mean()) if not trades.empty and "slippage_bps" in trades else 0.0
 
     return {
         "total_return": float(total_return),
@@ -379,6 +431,12 @@ def calculate_metrics(equity_curve: pd.DataFrame, rebalance_returns: List[float]
         "calmar": calmar,
         "max_drawdown": max_drawdown,
         "rebalance_win_rate": float(win_rate),
+        "turnover": turnover,
+        "avg_gross_exposure": avg_gross_exposure,
+        "avg_target_exposure": avg_target_exposure,
+        "exposure_time": exposure_time,
+        "hit_ratio": hit_ratio,
+        "avg_slippage_bps": avg_slippage_bps,
     }
 
 
@@ -514,6 +572,7 @@ def sync_position_meta(
                 last_trade_ts=ts_ms,
                 last_signal_score=0.0,
                 last_reason="recovered_from_balance",
+                entry_day=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d"),
             )
         else:
             meta.quantity = quantity
@@ -553,7 +612,7 @@ def quantity_for_fraction(
     return min(quantity, quantity_for_notional(cfg, trade_pairs, pair, quantity * price * fraction, price))
 
 
-def execution_price(side: str, market_row: Dict[str, float], quantity: float, reference_price: float) -> float:
+def execution_price(side: str, market_row: Dict[str, float], quantity: float, reference_price: float, cfg: Config | None = None) -> float:
     if quantity <= 0:
         return 0.0
     mid = float(market_row.get("price", reference_price))
@@ -569,10 +628,20 @@ def execution_price(side: str, market_row: Dict[str, float], quantity: float, re
     fallback_liquidity = max(daily_liquidity / (24 * 60) * 0.25, 1.0)
     effective_liquidity = max(minute_liquidity, fallback_liquidity)
     participation = notional / effective_liquidity if effective_liquidity > 0 else 1.0
-    impact = clamp(math.sqrt(max(participation, 0.0)) * 0.0005, 0.0, 0.0030)
+    impact_coeff = getattr(cfg, "slippage_impact_coeff", 0.0005) if cfg is not None else 0.0005
+    max_impact = getattr(cfg, "slippage_max_impact", 0.0030) if cfg is not None else 0.0030
+    impact = clamp(math.sqrt(max(participation, 0.0)) * impact_coeff, 0.0, max_impact)
     if side == "BUY":
         return base_price * (1.0 + impact)
     return max(base_price * (1.0 - impact), 1e-12)
+
+
+def slippage_bps(side: str, executed_price: float, reference_price: float) -> float:
+    if executed_price <= 0 or reference_price <= 0:
+        return 0.0
+    if side == "BUY":
+        return (executed_price / reference_price - 1.0) * 10_000.0
+    return (1.0 - executed_price / reference_price) * 10_000.0
 
 
 def build_position_meta(state: SimBacktestState, pair: str, quantity: float, price: float, score: float, ts_ms: int) -> SimPositionMeta:
@@ -586,6 +655,7 @@ def build_position_meta(state: SimBacktestState, pair: str, quantity: float, pri
             last_trade_ts=ts_ms,
             last_signal_score=score,
             last_reason="recovered_from_balance",
+            entry_day=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d"),
         )
     meta.quantity = quantity
     meta.highest_price = max(meta.highest_price, price)
@@ -593,25 +663,206 @@ def build_position_meta(state: SimBacktestState, pair: str, quantity: float, pri
     return meta
 
 
-def exit_reasons(cfg: Config, pair: str, meta: SimPositionMeta, price: float, score: float, targets: Dict[str, float]) -> List[str]:
+def exit_reasons(cfg: Config, pair: str, meta: SimPositionMeta, price: float, score: float, targets: Dict[str, float], ts_ms: int) -> List[str]:
     reasons: List[str] = []
     if price <= meta.entry_price * (1 - cfg.per_position_stop_loss):
         reasons.append("stop_loss")
     if price <= meta.highest_price * (1 - cfg.per_position_trailing_stop):
         reasons.append("trailing_stop")
-    if score < cfg.exit_score_threshold:
+    recovery_position = meta.last_reason == "recovery_reentry"
+    min_hold_minutes = float(getattr(cfg, "min_hold_minutes", 180))
+    if recovery_position:
+        min_hold_minutes *= float(getattr(cfg, "recovery_min_hold_multiplier", 2.0))
+    min_hold_ms = int(min_hold_minutes * 60_000)
+    allow_soft_exit = ts_ms - meta.last_trade_ts >= min_hold_ms
+    same_day_entry = meta.entry_day == datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    if getattr(cfg, "block_same_day_soft_exit", True) and same_day_entry:
+        allow_soft_exit = False
+    exit_threshold = cfg.exit_score_threshold - (float(getattr(cfg, "recovery_exit_score_grace", 0.08)) if recovery_position else 0.0)
+    if allow_soft_exit and score < exit_threshold:
         reasons.append("score_decay")
-    if pair not in targets:
+    if allow_soft_exit and pair not in targets:
         reasons.append("not_in_targets")
     return reasons
+
+
+def portfolio_drawdown_response(cfg: Config, drawdown: float) -> Tuple[float, int]:
+    max_dd = max(float(getattr(cfg, "max_portfolio_drawdown", 0.10)), 1e-9)
+    severity = clamp((drawdown - max_dd) / max_dd, 0.0, 1.0)
+    sell_floor = getattr(cfg, "portfolio_drawdown_sell_floor", 0.20)
+    sell_cap = getattr(cfg, "portfolio_drawdown_sell_cap", 0.50)
+    cooldown_floor = int(getattr(cfg, "portfolio_drawdown_cooldown_floor_minutes", 240))
+    cooldown_cap = int(getattr(cfg, "portfolio_drawdown_cooldown_minutes", 1440))
+    sell_fraction = clamp(sell_floor + (sell_cap - sell_floor) * severity, sell_floor, sell_cap)
+    cooldown_minutes = int(round(cooldown_floor + (cooldown_cap - cooldown_floor) * severity))
+    return sell_fraction, cooldown_minutes
 
 
 def set_cooldown(state: SimBacktestState, pair: str, ts_ms: int, minutes: int) -> None:
     state.cooldown_until[pair] = ts_ms + minutes * 60_000
 
 
+def prune_recovery_entry_counters(state: SimBacktestState, ts_ms: int) -> None:
+    current_day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    state.recovery_entries_by_day = {
+        day: count for day, count in state.recovery_entries_by_day.items() if day >= current_day
+    }
+    state.trades_by_day = {
+        day: count for day, count in state.trades_by_day.items() if day >= current_day
+    }
+    state.soft_trades_by_day = {
+        day: count for day, count in state.soft_trades_by_day.items() if day >= current_day
+    }
+    state.buy_trades_by_day = {
+        day: count for day, count in state.buy_trades_by_day.items() if day >= current_day
+    }
+
+
+def trade_count_today(state: SimBacktestState, ts_ms: int) -> int:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    return state.trades_by_day.get(day_key, 0)
+
+
+def soft_trade_count_today(state: SimBacktestState, ts_ms: int) -> int:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    return state.soft_trades_by_day.get(day_key, 0)
+
+
+def buy_trade_count_today(state: SimBacktestState, ts_ms: int) -> int:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    return state.buy_trades_by_day.get(day_key, 0)
+
+
+def is_hard_risk_reason(reason: str) -> bool:
+    hard_tokens = ("stop_loss", "trailing_stop", "portfolio_drawdown", "flash_crash_defense")
+    return any(token in reason for token in hard_tokens)
+
+
+def can_place_soft_trade(state: SimBacktestState, cfg: Config, ts_ms: int) -> bool:
+    limit = max(int(getattr(cfg, "daily_soft_trade_limit", 0)), 0)
+    return limit <= 0 or soft_trade_count_today(state, ts_ms) < limit
+
+
+def can_place_new_entry(state: SimBacktestState, cfg: Config, ts_ms: int) -> bool:
+    limit = max(int(getattr(cfg, "daily_new_entry_limit", 0)), 0)
+    return limit <= 0 or buy_trade_count_today(state, ts_ms) < limit
+
+
+def record_trade_activity(state: SimBacktestState, ts_ms: int, side: str, reason: str) -> None:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    state.trades_by_day[day_key] = state.trades_by_day.get(day_key, 0) + 1
+    if side.upper() == "BUY":
+        state.buy_trades_by_day[day_key] = state.buy_trades_by_day.get(day_key, 0) + 1
+    if not is_hard_risk_reason(reason):
+        state.soft_trades_by_day[day_key] = state.soft_trades_by_day.get(day_key, 0) + 1
+
+
+def can_place_recovery_entry(state: SimBacktestState, cfg: Config, ts_ms: int) -> bool:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    return state.recovery_entries_by_day.get(day_key, 0) < int(getattr(cfg, "recovery_daily_entry_limit", 1))
+
+
+def record_recovery_entry(state: SimBacktestState, ts_ms: int) -> None:
+    day_key = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+    state.recovery_entries_by_day[day_key] = state.recovery_entries_by_day.get(day_key, 0) + 1
+
+
 def in_cooldown(state: SimBacktestState, pair: str, ts_ms: int) -> bool:
     return ts_ms < state.cooldown_until.get(pair, 0)
+
+
+def fast_shock_defense(
+    cfg: Config,
+    state: SimBacktestState,
+    history: Dict[str, Deque[Dict[str, float]]],
+    quantities: Dict[str, float],
+    current_prices: Dict[str, float],
+    current_market: Dict[str, Dict[str, float]],
+    trade_pairs: Dict[str, Dict[str, Any]],
+    pair_to_symbol: Dict[str, str],
+    ts: datetime,
+    ts_ms: int,
+    cash: float,
+    fee_rate: float,
+    initial_equity: float,
+    running_peak_equity: float,
+    trade_rows: List[Dict[str, Any]],
+) -> tuple[float, set[str], bool]:
+    skip_trim_pairs: set[str] = set()
+    triggered = False
+    lookback = max(int(getattr(cfg, "flash_crash_lookback_minutes", 5)), 3)
+    drop_threshold = float(getattr(cfg, "flash_crash_drop_threshold", -0.03))
+    rebound_threshold = float(getattr(cfg, "flash_crash_rebound_threshold", 0.008))
+    sell_fraction = float(getattr(cfg, "flash_crash_sell_fraction", 0.50))
+    for pair, quantity in list(quantities.items()):
+        series = history.get(pair)
+        if quantity <= 0 or not series or len(series) < lookback:
+            continue
+        prices = [float(entry.get("price", 0.0)) for entry in list(series)[-lookback:] if float(entry.get("price", 0.0)) > 0]
+        if len(prices) < 3:
+            continue
+        price = current_prices.get(pair, 0.0)
+        market_row = current_market.get(pair)
+        if price <= 0 or market_row is None:
+            continue
+        recent_peak = max(prices)
+        recent_low = min(prices)
+        drop_from_peak = price / recent_peak - 1.0 if recent_peak > 0 else 0.0
+        rebound_from_low = price / recent_low - 1.0 if recent_low > 0 else 0.0
+        if drop_from_peak > drop_threshold or rebound_from_low >= rebound_threshold:
+            continue
+        sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, sell_fraction)
+        if sell_quantity <= 0:
+            continue
+        executed_price = execution_price("SELL", market_row, sell_quantity, price, cfg)
+        notional = sell_quantity * executed_price
+        fee_paid = notional * fee_rate
+        cash += notional - fee_paid
+        meta = state.positions_meta.get(pair)
+        realized_pnl = (executed_price - meta.entry_price) * sell_quantity if meta is not None else 0.0
+        remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
+        if remaining_quantity > quantity * 1e-6:
+            quantities[pair] = remaining_quantity
+            if meta:
+                meta.quantity = remaining_quantity
+        else:
+            quantities.pop(pair, None)
+            state.positions_meta.pop(pair, None)
+        set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
+        skip_trim_pairs.add(pair)
+        triggered = True
+        trade_score = score_trade_point(
+            equity_value=mark_to_market_equity(cash, quantities, current_prices),
+            initial_equity=initial_equity,
+            running_peak=running_peak_equity,
+            signal_weight=0.0,
+            risk_on=state.risk_on,
+            market_regime="risk_off",
+        )
+        trade_rows.append(
+            {
+                "ts": ts.isoformat(),
+                "pair": pair,
+                "symbol": pair_to_symbol[pair],
+                "side": "SELL",
+                "price": executed_price,
+                "quantity": sell_quantity,
+                "notional": notional,
+                "turnover": notional,
+                "fee_paid": fee_paid,
+                "realized_pnl": realized_pnl,
+                "slippage_bps": slippage_bps("SELL", executed_price, price),
+                "target_weight": 0.0,
+                "signal_score": -999.0,
+                "reason": "flash_crash_defense",
+                "risk_on": int(bool(state.risk_on)),
+                "market_regime": "risk_off",
+                "signal_regime": "shock_exit",
+                **trade_score,
+            }
+        )
+        record_trade_activity(state, ts_ms, "SELL", "flash_crash_defense")
+    return cash, skip_trim_pairs, triggered
 
 
 def unrealized_return(entry_price: float, price: float) -> float:
@@ -627,6 +878,7 @@ def run_backtest(
     trade_pairs: Dict[str, Dict[str, Any]],
     initial_equity: float,
     rebalance_minutes: int,
+    risk_check_minutes: int,
     fee_rate: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
     strategy = MomentumStrategy(cfg)
@@ -641,6 +893,9 @@ def run_backtest(
     rebalance_returns: List[float] = []
     last_rebalance_equity = initial_equity
     running_peak_equity = initial_equity
+    latest_target_exposure = 0.0
+    latest_market_regime = "neutral"
+    latest_signal_regime = "neutral"
 
     for step, ts in enumerate(common_index):
         ts_ms = int(ts.timestamp() * 1000.0)
@@ -669,31 +924,62 @@ def run_backtest(
         equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
         state.peak_equity = max(state.peak_equity, equity_before_rebalance)
         sync_position_meta(state, quantities, current_prices, ts_ms)
+        prune_recovery_entry_counters(state, ts_ms)
 
-        if step > 0 and step % rebalance_minutes == 0:
-            skip_trim_pairs: set[str] = set()
-            allow_new_buys = ts_ms >= state.portfolio_reentry_allowed_at
+        cash, shock_skip_pairs, shock_triggered = fast_shock_defense(
+            cfg,
+            state,
+            history,
+            quantities,
+            current_prices,
+            current_market,
+            trade_pairs,
+            pair_to_symbol,
+            ts,
+            ts_ms,
+            cash,
+            fee_rate,
+            initial_equity,
+            running_peak_equity,
+            trade_rows,
+        )
+        if shock_triggered:
+            state.portfolio_reentry_allowed_at = max(
+                state.portfolio_reentry_allowed_at,
+                ts_ms + cfg.cooldown_minutes * 60_000,
+            )
+            sync_position_meta(state, quantities, current_prices, ts_ms)
+            equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
+
+        do_full_rebalance = step > 0 and step % rebalance_minutes == 0
+        do_risk_check = step > 0 and step % risk_check_minutes == 0
+        if do_risk_check or do_full_rebalance:
+            skip_trim_pairs: set[str] = set(shock_skip_pairs)
+            allow_new_buys = do_full_rebalance and ts_ms >= state.portfolio_reentry_allowed_at
             drawdown = 1.0 - (equity_before_rebalance / state.peak_equity) if state.peak_equity > 0 else 0.0
             if drawdown >= cfg.max_portfolio_drawdown and quantities:
+                dd_sell_fraction, dd_cooldown_minutes = portfolio_drawdown_response(cfg, drawdown)
                 allow_new_buys = False
                 state.portfolio_reentry_allowed_at = max(
                     state.portfolio_reentry_allowed_at,
-                    ts_ms + cfg.portfolio_drawdown_cooldown_minutes * 60_000,
+                    ts_ms + dd_cooldown_minutes * 60_000,
                 )
                 for pair, quantity in list(quantities.items()):
                     price = current_prices.get(pair, 0.0)
                     market_row = current_market.get(pair)
                     if quantity <= 0 or price <= 0:
                         continue
-                    sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, 0.50)
+                    sell_quantity = quantity_for_fraction(cfg, trade_pairs, pair, quantity, price, dd_sell_fraction)
                     if sell_quantity <= 0:
                         continue
                     if market_row is None:
                         continue
-                    executed_price = execution_price("SELL", market_row, sell_quantity, price)
+                    executed_price = execution_price("SELL", market_row, sell_quantity, price, cfg)
                     notional = sell_quantity * executed_price
                     fee_paid = notional * fee_rate
                     cash += notional - fee_paid
+                    meta = state.positions_meta.get(pair)
+                    realized_pnl = (executed_price - meta.entry_price) * sell_quantity if meta is not None else 0.0
                     remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
                     if remaining_quantity > quantity * 1e-6:
                         quantities[pair] = remaining_quantity
@@ -724,6 +1010,8 @@ def run_backtest(
                             "notional": notional,
                             "turnover": notional,
                             "fee_paid": fee_paid,
+                            "realized_pnl": realized_pnl,
+                            "slippage_bps": slippage_bps("SELL", executed_price, price),
                             "target_weight": 0.0,
                             "signal_score": -999.0,
                             "reason": "portfolio_drawdown",
@@ -733,20 +1021,32 @@ def run_backtest(
                             **trade_score,
                         }
                     )
+                    record_trade_activity(state, ts_ms, "SELL", "portfolio_drawdown")
                 sync_position_meta(state, quantities, current_prices, ts_ms)
                 equity_before_rebalance = mark_to_market_equity(cash, quantities, current_prices)
+                if not quantities:
+                    state.portfolio_reentry_allowed_at = min(
+                        state.portfolio_reentry_allowed_at,
+                        ts_ms + int(getattr(cfg, "empty_book_reentry_minutes", 240)) * 60_000,
+                    )
 
             signals = strategy.generate_signals(
                 history=history,
                 trade_pairs=trade_pairs,
                 positions=quantities.copy(),
                 prev_risk_on=state.risk_on,
+                current_drawdown=drawdown,
             )
             state.risk_on = bool(signals["risk_on"])
             target_weights = signals["weights"]
+            entry_modes = signals.get("entry_modes", {})
+            daily_activity_probe = signals.get("daily_activity_probe")
             features = signals["features"]
             signal_regime = str(signals["regime"]["regime"])
             market_regime = str(signals["portfolio_risk"]["market_regime"])
+            latest_target_exposure = float(signals["portfolio_risk"].get("target_exposure", 0.0))
+            latest_market_regime = market_regime
+            latest_signal_regime = signal_regime
 
             if features:
                 for pair, quantity in list(quantities.items()):
@@ -756,8 +1056,12 @@ def run_backtest(
                         continue
                     score = features.get(pair, {}).get("score", -999.0)
                     meta = build_position_meta(state, pair, quantity, price, score, ts_ms)
-                    reasons = exit_reasons(cfg, pair, meta, price, score, target_weights)
+                    reasons = exit_reasons(cfg, pair, meta, price, score, target_weights, ts_ms)
                     if reasons:
+                        soft_only_reasons = [reason for reason in reasons if not is_hard_risk_reason(reason)]
+                        if soft_only_reasons and not can_place_soft_trade(state, cfg, ts_ms):
+                            state.positions_meta[pair] = meta
+                            continue
                         current_return = unrealized_return(meta.entry_price, price)
                         protected_profit = current_return >= cfg.profit_protect_threshold
                         if "stop_loss" in reasons or "trailing_stop" in reasons:
@@ -781,10 +1085,11 @@ def run_backtest(
                         if market_row is None:
                             state.positions_meta[pair] = meta
                             continue
-                        executed_price = execution_price("SELL", market_row, sell_quantity, price)
+                        executed_price = execution_price("SELL", market_row, sell_quantity, price, cfg)
                         notional = sell_quantity * executed_price
                         fee_paid = notional * fee_rate
                         cash += notional - fee_paid
+                        realized_pnl = (executed_price - meta.entry_price) * sell_quantity
                         remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
                         if remaining_quantity > quantity * 1e-6:
                             quantities[pair] = remaining_quantity
@@ -816,6 +1121,8 @@ def run_backtest(
                                 "notional": notional,
                                 "turnover": notional,
                                 "fee_paid": fee_paid,
+                                "realized_pnl": realized_pnl,
+                                "slippage_bps": slippage_bps("SELL", executed_price, price),
                                 "target_weight": target_weights.get(pair, 0.0),
                                 "signal_score": score,
                                 "reason": "+".join(reasons),
@@ -825,170 +1132,296 @@ def run_backtest(
                                 **trade_score,
                             }
                         )
+                        record_trade_activity(state, ts_ms, "SELL", "+".join(reasons))
                     else:
                         state.positions_meta[pair] = meta
 
-                portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
-                notional_map = current_notional(quantities, current_prices)
-                threshold = rebalance_notional_threshold(cfg, portfolio_equity)
-                for pair, quantity in list(quantities.items()):
-                    if pair in skip_trim_pairs:
-                        continue
-                    price = current_prices.get(pair, 0.0)
-                    market_row = current_market.get(pair)
-                    if price <= 0:
-                        continue
-                    target_usd = portfolio_equity * target_weights.get(pair, 0.0)
-                    current_usd = notional_map.get(pair, 0.0)
-                    trim_usd = current_usd - target_usd
-                    if trim_usd < threshold:
-                        continue
-                    sell_quantity = quantity if target_usd <= 0 else quantity_for_notional(cfg, trade_pairs, pair, trim_usd, price)
-                    if sell_quantity <= 0:
-                        continue
-                    if market_row is None:
-                        continue
-                    score = features.get(pair, {}).get("score", -999.0)
-                    reason = "target_exit_retry" if target_usd <= 0 else "target_trim"
-                    executed_price = execution_price("SELL", market_row, sell_quantity, price)
-                    notional = sell_quantity * executed_price
-                    fee_paid = notional * fee_rate
-                    cash += notional - fee_paid
-                    remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
-                    if remaining_quantity > quantity * 1e-6:
-                        quantities[pair] = remaining_quantity
+                if do_full_rebalance:
+                    portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
+                    turnover_budget = portfolio_equity * getattr(cfg, "max_turnover_per_rebalance", 0.60)
+                    if signal_regime == "range":
+                        turnover_budget *= getattr(cfg, "range_turnover_multiplier", 0.35)
+                    notional_map = current_notional(quantities, current_prices)
+                    threshold = rebalance_notional_threshold(cfg, portfolio_equity)
+                    for pair, quantity in list(quantities.items()):
+                        if pair in skip_trim_pairs:
+                            continue
+                        price = current_prices.get(pair, 0.0)
+                        market_row = current_market.get(pair)
+                        if price <= 0:
+                            continue
+                        target_usd = portfolio_equity * target_weights.get(pair, 0.0)
+                        current_usd = notional_map.get(pair, 0.0)
+                        trim_usd = current_usd - target_usd
+                        if trim_usd < threshold:
+                            continue
                         meta = state.positions_meta.get(pair)
-                        if meta:
-                            meta.quantity = remaining_quantity
-                    else:
-                        quantities.pop(pair, None)
-                        state.positions_meta.pop(pair, None)
-                        if target_usd <= 0:
-                            set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
-                    post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
-                    trade_score = score_trade_point(
-                        equity_value=post_trade_equity,
-                        initial_equity=initial_equity,
-                        running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
-                        signal_weight=target_weights.get(pair, 0.0),
-                        risk_on=bool(signals["risk_on"]),
-                        market_regime=market_regime,
-                    )
-                    trade_rows.append(
-                        {
-                            "ts": ts.isoformat(),
-                            "pair": pair,
-                            "symbol": pair_to_symbol[pair],
-                            "side": "SELL",
-                            "price": executed_price,
-                            "quantity": sell_quantity,
-                            "notional": notional,
-                            "turnover": notional,
-                            "fee_paid": fee_paid,
-                            "target_weight": target_weights.get(pair, 0.0),
-                            "signal_score": score,
-                            "reason": reason,
-                            "risk_on": int(bool(signals["risk_on"])),
-                            "market_regime": market_regime,
-                            "signal_regime": signal_regime,
-                            **trade_score,
-                        }
-                    )
-
-                portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
-                usd_free = cash
-                threshold = rebalance_notional_threshold(cfg, portfolio_equity)
-                notional_map = current_notional(quantities, current_prices)
-                for pair, weight in sorted(target_weights.items(), key=lambda item: item[1], reverse=True):
-                    if not allow_new_buys:
-                        break
-                    if in_cooldown(state, pair, ts_ms):
-                        continue
-                    price = current_prices.get(pair, 0.0)
-                    market_row = current_market.get(pair)
-                    if price <= 0 or pair not in features:
-                        continue
-                    target_usd = portfolio_equity * weight
-                    current_usd = notional_map.get(pair, 0.0)
-                    diff_usd = target_usd - current_usd
-                    if diff_usd < threshold:
-                        continue
-                    usable_cash = max(0.0, usd_free - portfolio_equity * cfg.cash_buffer)
-                    if usable_cash <= 0:
-                        continue
-                    buy_usd = min(diff_usd, usable_cash)
-                    buy_quantity = quantity_for_notional(cfg, trade_pairs, pair, buy_usd, price)
-                    if buy_quantity <= 0:
-                        continue
-                    if market_row is None:
-                        continue
-                    executed_price = execution_price("BUY", market_row, buy_quantity, price)
-                    notional = buy_quantity * executed_price
-                    fee_paid = notional * fee_rate
-                    total_cost = notional + fee_paid
-                    if total_cost > cash + 1e-9:
-                        continue
-                    cash -= total_cost
-                    quantities[pair] = quantities.get(pair, 0.0) + buy_quantity
-                    score = features[pair]["score"]
-                    meta = state.positions_meta.get(pair)
-                    if meta is None:
-                        state.positions_meta[pair] = SimPositionMeta(
-                            pair=pair,
-                            quantity=buy_quantity,
-                            entry_price=executed_price,
-                            highest_price=executed_price,
-                            last_trade_ts=ts_ms,
-                            last_signal_score=score,
-                            last_reason="target_rebalance",
+                        same_day_entry = (
+                            meta is not None
+                            and meta.entry_day == datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
                         )
-                    else:
-                        previous_quantity = meta.quantity
-                        new_quantity = previous_quantity + buy_quantity
-                        if new_quantity > 0:
-                            meta.entry_price = ((meta.entry_price * previous_quantity) + (executed_price * buy_quantity)) / new_quantity
-                        meta.quantity = new_quantity
-                        meta.highest_price = max(meta.highest_price, executed_price)
-                        meta.last_trade_ts = ts_ms
-                        meta.last_signal_score = score
-                        meta.last_reason = "target_rebalance"
-                    usd_free -= notional
-                    notional_map[pair] = quantities[pair] * price
-                    post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
-                    trade_score = score_trade_point(
-                        equity_value=post_trade_equity,
-                        initial_equity=initial_equity,
-                        running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
-                        signal_weight=weight,
-                        risk_on=bool(signals["risk_on"]),
-                        market_regime=market_regime,
-                    )
-                    trade_rows.append(
-                        {
-                            "ts": ts.isoformat(),
-                            "pair": pair,
-                            "symbol": pair_to_symbol[pair],
-                            "side": "BUY",
-                            "price": executed_price,
-                            "quantity": buy_quantity,
-                            "notional": notional,
-                            "turnover": notional,
-                            "fee_paid": fee_paid,
-                            "target_weight": weight,
-                            "signal_score": score,
-                            "reason": "target_rebalance",
-                            "risk_on": int(bool(signals["risk_on"])),
-                            "market_regime": market_regime,
-                            "signal_regime": signal_regime,
-                            **trade_score,
-                        }
-                    )
+                        if getattr(cfg, "block_same_day_soft_exit", True) and same_day_entry and target_usd <= 0:
+                            continue
+                        sell_quantity = quantity if target_usd <= 0 else quantity_for_notional(cfg, trade_pairs, pair, trim_usd, price)
+                        if sell_quantity <= 0:
+                            continue
+                        if not can_place_soft_trade(state, cfg, ts_ms):
+                            continue
+                        if market_row is None:
+                            continue
+                        if turnover_budget <= 0:
+                            continue
+                        score = features.get(pair, {}).get("score", -999.0)
+                        reason = "target_exit_retry" if target_usd <= 0 else "target_trim"
+                        executed_price = execution_price("SELL", market_row, sell_quantity, price, cfg)
+                        notional = sell_quantity * executed_price
+                        if notional > turnover_budget:
+                            sell_quantity = quantity_for_notional(cfg, trade_pairs, pair, turnover_budget, price)
+                            if sell_quantity <= 0:
+                                continue
+                            executed_price = execution_price("SELL", market_row, sell_quantity, price, cfg)
+                            notional = sell_quantity * executed_price
+                        fee_paid = notional * fee_rate
+                        cash += notional - fee_paid
+                        turnover_budget -= notional
+                        meta = state.positions_meta.get(pair)
+                        realized_pnl = (executed_price - meta.entry_price) * sell_quantity if meta is not None else 0.0
+                        remaining_quantity = quantities.get(pair, 0.0) - sell_quantity
+                        if remaining_quantity > quantity * 1e-6:
+                            quantities[pair] = remaining_quantity
+                            if meta:
+                                meta.quantity = remaining_quantity
+                        else:
+                            quantities.pop(pair, None)
+                            state.positions_meta.pop(pair, None)
+                            if target_usd <= 0:
+                                set_cooldown(state, pair, ts_ms, cfg.cooldown_minutes)
+                        post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                        trade_score = score_trade_point(
+                            equity_value=post_trade_equity,
+                            initial_equity=initial_equity,
+                            running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                            signal_weight=target_weights.get(pair, 0.0),
+                            risk_on=bool(signals["risk_on"]),
+                            market_regime=market_regime,
+                        )
+                        trade_rows.append(
+                            {
+                                "ts": ts.isoformat(),
+                                "pair": pair,
+                                "symbol": pair_to_symbol[pair],
+                                "side": "SELL",
+                                "price": executed_price,
+                                "quantity": sell_quantity,
+                                "notional": notional,
+                                "turnover": notional,
+                                "fee_paid": fee_paid,
+                                "realized_pnl": realized_pnl,
+                                "slippage_bps": slippage_bps("SELL", executed_price, price),
+                                "target_weight": target_weights.get(pair, 0.0),
+                                "signal_score": score,
+                                "reason": reason,
+                                "risk_on": int(bool(signals["risk_on"])),
+                                "market_regime": market_regime,
+                                "signal_regime": signal_regime,
+                                **trade_score,
+                            }
+                        )
+                        record_trade_activity(state, ts_ms, "SELL", reason)
+
+                    portfolio_equity = mark_to_market_equity(cash, quantities, current_prices)
+                    usd_free = cash
+                    threshold = rebalance_notional_threshold(cfg, portfolio_equity)
+                    notional_map = current_notional(quantities, current_prices)
+                    for pair, weight in sorted(target_weights.items(), key=lambda item: item[1], reverse=True):
+                        if not allow_new_buys:
+                            break
+                        if turnover_budget <= 0:
+                            break
+                        if not can_place_soft_trade(state, cfg, ts_ms):
+                            break
+                        if not can_place_new_entry(state, cfg, ts_ms):
+                            break
+                        if in_cooldown(state, pair, ts_ms):
+                            continue
+                        price = current_prices.get(pair, 0.0)
+                        market_row = current_market.get(pair)
+                        if price <= 0 or pair not in features:
+                            continue
+                        target_usd = portfolio_equity * weight
+                        current_usd = notional_map.get(pair, 0.0)
+                        diff_usd = target_usd - current_usd
+                        if diff_usd < threshold:
+                            continue
+                        usable_cash = max(0.0, usd_free - portfolio_equity * cfg.cash_buffer)
+                        if usable_cash <= 0:
+                            continue
+                        buy_usd = min(diff_usd, usable_cash)
+                        buy_quantity = quantity_for_notional(cfg, trade_pairs, pair, buy_usd, price)
+                        if buy_quantity <= 0:
+                            continue
+                        if market_row is None:
+                            continue
+                        executed_price = execution_price("BUY", market_row, buy_quantity, price, cfg)
+                        notional = buy_quantity * executed_price
+                        if notional > turnover_budget:
+                            buy_quantity = quantity_for_notional(cfg, trade_pairs, pair, turnover_budget, price)
+                            if buy_quantity <= 0:
+                                continue
+                            executed_price = execution_price("BUY", market_row, buy_quantity, price, cfg)
+                            notional = buy_quantity * executed_price
+                        fee_paid = notional * fee_rate
+                        total_cost = notional + fee_paid
+                        if total_cost > cash + 1e-9:
+                            continue
+                        cash -= total_cost
+                        turnover_budget -= notional
+                        quantities[pair] = quantities.get(pair, 0.0) + buy_quantity
+                        score = features[pair]["score"]
+                        entry_reason = entry_modes.get(pair, "target_rebalance")
+                        if entry_reason == "recovery_reentry" and not can_place_recovery_entry(state, cfg, ts_ms):
+                            continue
+                        meta = state.positions_meta.get(pair)
+                        if meta is None:
+                            state.positions_meta[pair] = SimPositionMeta(
+                                pair=pair,
+                                quantity=buy_quantity,
+                                entry_price=executed_price,
+                                highest_price=executed_price,
+                                last_trade_ts=ts_ms,
+                                last_signal_score=score,
+                                last_reason=entry_reason,
+                                recovery_trade_day=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d") if entry_reason == "recovery_reentry" else "",
+                                entry_day=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d"),
+                            )
+                        else:
+                            previous_quantity = meta.quantity
+                            new_quantity = previous_quantity + buy_quantity
+                            if new_quantity > 0:
+                                meta.entry_price = ((meta.entry_price * previous_quantity) + (executed_price * buy_quantity)) / new_quantity
+                            meta.quantity = new_quantity
+                            meta.highest_price = max(meta.highest_price, executed_price)
+                            meta.last_trade_ts = ts_ms
+                            meta.last_signal_score = score
+                            meta.last_reason = entry_reason
+                            meta.entry_day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+                            if entry_reason == "recovery_reentry":
+                                meta.recovery_trade_day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+                        usd_free -= notional
+                        if entry_reason == "recovery_reentry":
+                            record_recovery_entry(state, ts_ms)
+                            set_cooldown(state, pair, ts_ms, int(getattr(cfg, "recovery_entry_cooldown_minutes", 720)))
+                        notional_map[pair] = quantities[pair] * price
+                        post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                        trade_score = score_trade_point(
+                            equity_value=post_trade_equity,
+                            initial_equity=initial_equity,
+                            running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                            signal_weight=weight,
+                            risk_on=bool(signals["risk_on"]),
+                            market_regime=market_regime,
+                        )
+                        trade_rows.append(
+                            {
+                                "ts": ts.isoformat(),
+                                "pair": pair,
+                                "symbol": pair_to_symbol[pair],
+                                "side": "BUY",
+                                "price": executed_price,
+                                "quantity": buy_quantity,
+                                "notional": notional,
+                                "turnover": notional,
+                                "fee_paid": fee_paid,
+                                "realized_pnl": 0.0,
+                                "slippage_bps": slippage_bps("BUY", executed_price, price),
+                                "target_weight": weight,
+                                "signal_score": score,
+                                "reason": entry_reason,
+                                "risk_on": int(bool(signals["risk_on"])),
+                                "market_regime": market_regime,
+                                "signal_regime": signal_regime,
+                                **trade_score,
+                            }
+                        )
+                        record_trade_activity(state, ts_ms, "BUY", entry_reason)
+
+                    if (
+                        getattr(cfg, "daily_activity_enabled", True)
+                        and do_full_rebalance
+                        and trade_count_today(state, ts_ms) <= 0
+                        and can_place_soft_trade(state, cfg, ts_ms)
+                        and can_place_new_entry(state, cfg, ts_ms)
+                        and daily_activity_probe
+                        and daily_activity_probe not in quantities
+                        and not in_cooldown(state, daily_activity_probe, ts_ms)
+                    ):
+                        price = current_prices.get(daily_activity_probe, 0.0)
+                        market_row = current_market.get(daily_activity_probe)
+                        feature = features.get(daily_activity_probe)
+                        if price > 0 and market_row is not None and feature is not None:
+                            probe_usd = min(
+                                max(0.0, cash - portfolio_equity * cfg.cash_buffer),
+                                portfolio_equity * getattr(cfg, "daily_activity_probe_exposure", 0.05),
+                            )
+                            buy_quantity = quantity_for_notional(cfg, trade_pairs, daily_activity_probe, probe_usd, price)
+                            if buy_quantity > 0:
+                                executed_price = execution_price("BUY", market_row, buy_quantity, price, cfg)
+                                notional = buy_quantity * executed_price
+                                fee_paid = notional * fee_rate
+                                total_cost = notional + fee_paid
+                                if total_cost <= cash + 1e-9:
+                                    cash -= total_cost
+                                    quantities[daily_activity_probe] = quantities.get(daily_activity_probe, 0.0) + buy_quantity
+                                    state.positions_meta[daily_activity_probe] = SimPositionMeta(
+                                        pair=daily_activity_probe,
+                                        quantity=quantities[daily_activity_probe],
+                                        entry_price=executed_price,
+                                        highest_price=executed_price,
+                                        last_trade_ts=ts_ms,
+                                        last_signal_score=feature["score"],
+                                        last_reason="daily_activity_probe",
+                                        entry_day=datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d"),
+                                    )
+                                    set_cooldown(state, daily_activity_probe, ts_ms, int(getattr(cfg, "daily_activity_entry_cooldown_minutes", 720)))
+                                    post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
+                                    trade_score = score_trade_point(
+                                        equity_value=post_trade_equity,
+                                        initial_equity=initial_equity,
+                                        running_peak=max(running_peak_equity, state.peak_equity, post_trade_equity),
+                                        signal_weight=getattr(cfg, "daily_activity_probe_exposure", 0.05),
+                                        risk_on=bool(signals["risk_on"]),
+                                        market_regime=market_regime,
+                                    )
+                                    trade_rows.append(
+                                        {
+                                            "ts": ts.isoformat(),
+                                            "pair": daily_activity_probe,
+                                            "symbol": pair_to_symbol[daily_activity_probe],
+                                            "side": "BUY",
+                                            "price": executed_price,
+                                            "quantity": buy_quantity,
+                                            "notional": notional,
+                                            "turnover": notional,
+                                            "fee_paid": fee_paid,
+                                            "realized_pnl": 0.0,
+                                            "slippage_bps": slippage_bps("BUY", executed_price, price),
+                                            "target_weight": getattr(cfg, "daily_activity_probe_exposure", 0.05),
+                                            "signal_score": feature["score"],
+                                            "reason": "daily_activity_probe",
+                                            "risk_on": int(bool(signals["risk_on"])),
+                                            "market_regime": market_regime,
+                                            "signal_regime": signal_regime,
+                                            **trade_score,
+                                        }
+                                    )
+                                    record_trade_activity(state, ts_ms, "BUY", "daily_activity_probe")
 
             sync_position_meta(state, quantities, current_prices, ts_ms)
             post_trade_equity = mark_to_market_equity(cash, quantities, current_prices)
-            if last_rebalance_equity > 0:
-                rebalance_returns.append(post_trade_equity / last_rebalance_equity - 1.0)
-            last_rebalance_equity = post_trade_equity
+            if do_full_rebalance:
+                if last_rebalance_equity > 0:
+                    rebalance_returns.append(post_trade_equity / last_rebalance_equity - 1.0)
+                last_rebalance_equity = post_trade_equity
             equity_before_rebalance = post_trade_equity
 
         marked_equity = mark_to_market_equity(cash, quantities, current_prices)
@@ -1000,12 +1433,15 @@ def run_backtest(
                 "cash": cash,
                 "gross_exposure": sum(current_notional(quantities, current_prices).values()) / marked_equity if marked_equity > 0 else 0.0,
                 "positions": len(quantities),
+                "target_exposure": latest_target_exposure,
+                "market_regime": latest_market_regime,
+                "signal_regime": latest_signal_regime,
             }
         )
 
     equity_curve = pd.DataFrame(equity_rows)
     trades = pd.DataFrame(trade_rows)
-    metrics = calculate_metrics(equity_curve, rebalance_returns)
+    metrics = calculate_metrics(equity_curve, trades, rebalance_returns)
     metrics["start_equity"] = float(initial_equity)
     metrics["end_equity"] = float(equity_curve["equity"].iloc[-1]) if not equity_curve.empty else float(initial_equity)
     metrics["trade_count"] = float(len(trades))
@@ -1135,9 +1571,21 @@ def main() -> None:
     cfg = Config.from_env()
     cache_dir = Path(args.cache_dir)
     output_dir = Path(args.output_dir)
+    exchange_info_cache = Path(args.exchange_info_cache)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    exchange_info = fetch_roostoo_exchange_info(args.roostoo_base_url)
+    try:
+        exchange_info = fetch_roostoo_exchange_info(args.roostoo_base_url)
+        save_exchange_info_cache(exchange_info_cache, exchange_info)
+    except Exception:
+        if exchange_info_cache.exists():
+            exchange_info = load_exchange_info_cache(exchange_info_cache)
+            print(f"Warning: using cached exchangeInfo from {exchange_info_cache}")
+        elif args.symbols:
+            exchange_info = build_synthetic_exchange_info(args.symbols, args.initial_equity)
+            print("Warning: using synthetic exchangeInfo derived from --symbols")
+        else:
+            raise
     pair_to_symbol, trade_pairs = resolve_roostoo_universe(args.symbols, exchange_info)
     if not pair_to_symbol:
         raise SystemExit("No Roostoo tradable pairs could be resolved to Binance symbols.")
@@ -1161,7 +1609,7 @@ def main() -> None:
 
     initial_equity = args.initial_equity
     if initial_equity is None:
-        initial_equity = float(exchange_info.get("InitialWallet", {}).get("USD", 50_000.0))
+        initial_equity = float(exchange_info.get("InitialWallet", {}).get("USD", 1_000_000.0))
 
     equity_curve, trades, metrics = run_backtest(
         cfg=cfg,
@@ -1170,6 +1618,7 @@ def main() -> None:
         trade_pairs=available_trade_pairs,
         initial_equity=initial_equity,
         rebalance_minutes=args.rebalance_minutes,
+        risk_check_minutes=args.risk_check_minutes,
         fee_rate=args.fee_rate,
     )
     scorecard = score_total_backtest(

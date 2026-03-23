@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import atexit
@@ -43,11 +43,16 @@ class Config:
     portfolio_log_csv: Path
     signal_log_csv: Path
     top_n: int
+    rebalance_minutes: int
+    risk_check_minutes: int
     target_gross_exposure: float
     max_single_weight: float
+    min_effective_weight: float
     cash_buffer: float
     entry_score_threshold: float
     exit_score_threshold: float
+    entry_confidence_threshold: float
+    hold_confidence_threshold: float
     rebalance_threshold: float
     min_rebalance_notional: float
     spread_threshold: float
@@ -75,6 +80,8 @@ class Config:
     risk_on_exposure_multiplier: float
     neutral_exposure_multiplier: float
     risk_off_exposure_multiplier: float
+    risk_on_exposure_floor: float
+    neutral_exposure_floor: float
     enable_volatility_targeting: bool
     target_portfolio_volatility: float
     min_vol_target_scale: float
@@ -95,7 +102,11 @@ class Config:
     per_position_trailing_stop: float
     max_portfolio_drawdown: float
     cooldown_minutes: int
+    min_hold_minutes: int
     portfolio_drawdown_cooldown_minutes: int
+    portfolio_drawdown_cooldown_floor_minutes: int
+    portfolio_drawdown_sell_floor: float
+    portfolio_drawdown_sell_cap: float
     profit_protect_threshold: float
     profit_protect_score_decay_fraction: float
     profit_protect_not_in_targets_fraction: float
@@ -110,6 +121,55 @@ class Config:
     loop_error_backoff_cap_seconds: int
     cancel_all_on_start: bool
     dry_run: bool
+    max_turnover_per_rebalance: float
+    range_entry_exposure: float
+    range_keep_exposure: float
+    range_max_positions: int
+    range_turnover_multiplier: float
+    enable_range_entries: bool
+    range_entry_confidence_floor: float
+    range_mean_reversion_floor: float
+    range_trend_stability_floor: float
+    range_defensive_score_threshold: float
+    enable_recovery_reentry: bool
+    recovery_entry_score_relaxation: float
+    recovery_entry_confidence_relaxation: float
+    recovery_reentry_exposure: float
+    recovery_max_positions: int
+    empty_book_reentry_minutes: int
+    recovery_rebound_confirmation: float
+    recovery_pullback_threshold: float
+    recovery_volume_confirmation_floor: float
+    recovery_trend_stability_floor: float
+    recovery_min_hold_multiplier: float
+    recovery_exit_score_grace: float
+    recovery_not_in_targets_confirm_bars: int
+    recovery_daily_entry_limit: int
+    recovery_entry_cooldown_minutes: int
+    block_same_day_soft_exit: bool
+    portfolio_min_positions: int
+    portfolio_max_positions: int
+    liquid_asset_volume_threshold: float
+    satellite_asset_volume_threshold: float
+    core_bucket_weight_cap: float
+    liquid_bucket_weight_cap: float
+    satellite_bucket_weight_cap: float
+    trend_state_score_boost: float
+    breakout_state_score_boost: float
+    rebound_state_score_boost: float
+    failed_rebound_score_penalty: float
+    range_chop_score_penalty: float
+    daily_activity_enabled: bool
+    daily_activity_probe_exposure: float
+    daily_activity_min_confidence: float
+    daily_activity_entry_cooldown_minutes: int
+    daily_soft_trade_limit: int
+    daily_new_entry_limit: int
+    flash_crash_lookback_minutes: int
+    flash_crash_drop_threshold: float
+    flash_crash_rebound_threshold: float
+    flash_crash_sell_fraction: float
+    shock_rebound_probe_boost: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -133,16 +193,21 @@ class Config:
             trade_log_csv=log_dir / "trades.csv",
             portfolio_log_csv=log_dir / "portfolio.csv",
             signal_log_csv=log_dir / "signals.csv",
-            top_n=int(os.getenv("TOP_N", "3")),
+            top_n=int(os.getenv("TOP_N", "4")),
+            rebalance_minutes=int(os.getenv("REBALANCE_MINUTES", "30")),
+            risk_check_minutes=int(os.getenv("RISK_CHECK_MINUTES", "15")),
             target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.72")),
             max_single_weight=float(os.getenv("MAX_SINGLE_WEIGHT", "0.28")),
+            min_effective_weight=float(os.getenv("MIN_EFFECTIVE_WEIGHT", "0.07")),
             cash_buffer=float(os.getenv("CASH_BUFFER", "0.25")),
             entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.68")),
             exit_score_threshold=float(os.getenv("EXIT_SCORE_THRESHOLD", "0.12")),
+            entry_confidence_threshold=float(os.getenv("ENTRY_CONFIDENCE_THRESHOLD", "0.55")),
+            hold_confidence_threshold=float(os.getenv("HOLD_CONFIDENCE_THRESHOLD", "0.30")),
             rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.03")),
             min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "25")),
             spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.006")),
-            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "150000")),
+            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "120000")),
             max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.05")),
             market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0005")),
             market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.52")),
@@ -153,7 +218,7 @@ class Config:
             vol_floor=float(os.getenv("VOL_FLOOR", "0.004")),
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
             holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.12")),
-            per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.035")),
+            per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.06")),
             risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "raw").strip().lower(),
             risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "60")),
             risk_return_method=os.getenv("RISK_RETURN_METHOD", "log").strip().lower(),
@@ -167,6 +232,8 @@ class Config:
             risk_on_exposure_multiplier=float(os.getenv("RISK_ON_EXPOSURE_MULTIPLIER", "1.0")),
             neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.7")),
             risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.35")),
+            risk_on_exposure_floor=float(os.getenv("RISK_ON_EXPOSURE_FLOOR", "0.80")),
+            neutral_exposure_floor=float(os.getenv("NEUTRAL_EXPOSURE_FLOOR", "0.45")),
             enable_volatility_targeting=env_bool("ENABLE_VOLATILITY_TARGETING", True),
             target_portfolio_volatility=float(os.getenv("TARGET_PORTFOLIO_VOLATILITY", "0.020")),
             min_vol_target_scale=float(os.getenv("MIN_VOL_TARGET_SCALE", "0.35")),
@@ -193,10 +260,14 @@ class Config:
             high_vol_feature_weight_multiplier=float(
                 os.getenv("HIGH_VOL_FEATURE_WEIGHT_MULTIPLIER", "0.80")
             ),
-            per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.045")),
+            per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.06")),
             max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
             cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
+            min_hold_minutes=int(os.getenv("MIN_HOLD_MINUTES", "240")),
             portfolio_drawdown_cooldown_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_MINUTES", "1440")),
+            portfolio_drawdown_cooldown_floor_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_FLOOR_MINUTES", "1440")),
+            portfolio_drawdown_sell_floor=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_FLOOR", "0.50")),
+            portfolio_drawdown_sell_cap=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_CAP", "0.50")),
             profit_protect_threshold=float(os.getenv("PROFIT_PROTECT_THRESHOLD", "0.10")),
             profit_protect_score_decay_fraction=float(os.getenv("PROFIT_PROTECT_SCORE_DECAY_FRACTION", "0.18")),
             profit_protect_not_in_targets_fraction=float(os.getenv("PROFIT_PROTECT_NOT_IN_TARGETS_FRACTION", "0.25")),
@@ -211,6 +282,55 @@ class Config:
             loop_error_backoff_cap_seconds=int(os.getenv("LOOP_ERROR_BACKOFF_CAP_SECONDS", "900")),
             cancel_all_on_start=env_bool("CANCEL_ALL_ON_START", False),
             dry_run=env_bool("DRY_RUN", True),
+            max_turnover_per_rebalance=float(os.getenv("MAX_TURNOVER_PER_REBALANCE", "0.60")),
+            range_entry_exposure=float(os.getenv("RANGE_ENTRY_EXPOSURE", "0.12")),
+            range_keep_exposure=float(os.getenv("RANGE_KEEP_EXPOSURE", "0.10")),
+            range_max_positions=int(os.getenv("RANGE_MAX_POSITIONS", "2")),
+            range_turnover_multiplier=float(os.getenv("RANGE_TURNOVER_MULTIPLIER", "0.35")),
+            enable_range_entries=env_bool("ENABLE_RANGE_ENTRIES", False),
+            range_entry_confidence_floor=float(os.getenv("RANGE_ENTRY_CONFIDENCE_FLOOR", "0.62")),
+            range_mean_reversion_floor=float(os.getenv("RANGE_MEAN_REVERSION_FLOOR", "0.00")),
+            range_trend_stability_floor=float(os.getenv("RANGE_TREND_STABILITY_FLOOR", "-0.05")),
+            range_defensive_score_threshold=float(os.getenv("RANGE_DEFENSIVE_SCORE_THRESHOLD", "0.08")),
+            enable_recovery_reentry=env_bool("ENABLE_RECOVERY_REENTRY", True),
+            recovery_entry_score_relaxation=float(os.getenv("RECOVERY_ENTRY_SCORE_RELAXATION", "0.10")),
+            recovery_entry_confidence_relaxation=float(os.getenv("RECOVERY_ENTRY_CONFIDENCE_RELAXATION", "0.06")),
+            recovery_reentry_exposure=float(os.getenv("RECOVERY_REENTRY_EXPOSURE", "0.08")),
+            recovery_max_positions=int(os.getenv("RECOVERY_MAX_POSITIONS", "2")),
+            empty_book_reentry_minutes=int(os.getenv("EMPTY_BOOK_REENTRY_MINUTES", "120")),
+            recovery_rebound_confirmation=float(os.getenv("RECOVERY_REBOUND_CONFIRMATION", "0.008")),
+            recovery_pullback_threshold=float(os.getenv("RECOVERY_PULLBACK_THRESHOLD", "-0.025")),
+            recovery_volume_confirmation_floor=float(os.getenv("RECOVERY_VOLUME_CONFIRMATION_FLOOR", "0.0")),
+            recovery_trend_stability_floor=float(os.getenv("RECOVERY_TREND_STABILITY_FLOOR", "-0.10")),
+            recovery_min_hold_multiplier=float(os.getenv("RECOVERY_MIN_HOLD_MULTIPLIER", "2.0")),
+            recovery_exit_score_grace=float(os.getenv("RECOVERY_EXIT_SCORE_GRACE", "0.08")),
+            recovery_not_in_targets_confirm_bars=int(os.getenv("RECOVERY_NOT_IN_TARGETS_CONFIRM_BARS", "6")),
+            recovery_daily_entry_limit=int(os.getenv("RECOVERY_DAILY_ENTRY_LIMIT", "1")),
+            recovery_entry_cooldown_minutes=int(os.getenv("RECOVERY_ENTRY_COOLDOWN_MINUTES", "720")),
+            block_same_day_soft_exit=env_bool("BLOCK_SAME_DAY_SOFT_EXIT", False),
+            portfolio_min_positions=int(os.getenv("PORTFOLIO_MIN_POSITIONS", "4")),
+            portfolio_max_positions=int(os.getenv("PORTFOLIO_MAX_POSITIONS", "5")),
+            liquid_asset_volume_threshold=float(os.getenv("LIQUID_ASSET_VOLUME_THRESHOLD", "400000")),
+            satellite_asset_volume_threshold=float(os.getenv("SATELLITE_ASSET_VOLUME_THRESHOLD", "180000")),
+            core_bucket_weight_cap=float(os.getenv("CORE_BUCKET_WEIGHT_CAP", "0.58")),
+            liquid_bucket_weight_cap=float(os.getenv("LIQUID_BUCKET_WEIGHT_CAP", "0.32")),
+            satellite_bucket_weight_cap=float(os.getenv("SATELLITE_BUCKET_WEIGHT_CAP", "0.10")),
+            trend_state_score_boost=float(os.getenv("TREND_STATE_SCORE_BOOST", "0.08")),
+            breakout_state_score_boost=float(os.getenv("BREAKOUT_STATE_SCORE_BOOST", "0.05")),
+            rebound_state_score_boost=float(os.getenv("REBOUND_STATE_SCORE_BOOST", "0.02")),
+            failed_rebound_score_penalty=float(os.getenv("FAILED_REBOUND_SCORE_PENALTY", "0.24")),
+            range_chop_score_penalty=float(os.getenv("RANGE_CHOP_SCORE_PENALTY", "0.16")),
+            daily_activity_enabled=env_bool("DAILY_ACTIVITY_ENABLED", True),
+            daily_activity_probe_exposure=float(os.getenv("DAILY_ACTIVITY_PROBE_EXPOSURE", "0.03")),
+            daily_activity_min_confidence=float(os.getenv("DAILY_ACTIVITY_MIN_CONFIDENCE", "0.55")),
+            daily_activity_entry_cooldown_minutes=int(os.getenv("DAILY_ACTIVITY_ENTRY_COOLDOWN_MINUTES", "360")),
+            daily_soft_trade_limit=int(os.getenv("DAILY_SOFT_TRADE_LIMIT", "8")),
+            daily_new_entry_limit=int(os.getenv("DAILY_NEW_ENTRY_LIMIT", "3")),
+            flash_crash_lookback_minutes=int(os.getenv("FLASH_CRASH_LOOKBACK_MINUTES", "5")),
+            flash_crash_drop_threshold=float(os.getenv("FLASH_CRASH_DROP_THRESHOLD", "-0.03")),
+            flash_crash_rebound_threshold=float(os.getenv("FLASH_CRASH_REBOUND_THRESHOLD", "0.008")),
+            flash_crash_sell_fraction=float(os.getenv("FLASH_CRASH_SELL_FRACTION", "0.50")),
+            shock_rebound_probe_boost=float(os.getenv("SHOCK_REBOUND_PROBE_BOOST", "0.08")),
         )
 
 
@@ -235,6 +355,26 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def portfolio_drawdown_response(cfg: Config, drawdown: float) -> tuple[float, int]:
+    max_dd = max(cfg.max_portfolio_drawdown, 1e-9)
+    severity = clamp((drawdown - max_dd) / max_dd, 0.0, 1.0)
+    sell_fraction = clamp(
+        cfg.portfolio_drawdown_sell_floor
+        + (cfg.portfolio_drawdown_sell_cap - cfg.portfolio_drawdown_sell_floor) * severity,
+        cfg.portfolio_drawdown_sell_floor,
+        cfg.portfolio_drawdown_sell_cap,
+    )
+    cooldown_minutes = int(round(
+        cfg.portfolio_drawdown_cooldown_floor_minutes
+        + (cfg.portfolio_drawdown_cooldown_minutes - cfg.portfolio_drawdown_cooldown_floor_minutes) * severity
+    ))
+    return sell_fraction, cooldown_minutes
 
 
 def round_down(value: float, decimals: int) -> float:
@@ -286,6 +426,8 @@ class PositionMeta:
     last_signal_score: float
     last_reason: str = ""
     not_in_targets_bars: int = 0
+    recovery_trade_day: str = ""
+    entry_day: str = ""
 
 
 @dataclass
@@ -306,6 +448,10 @@ class BotState:
     start_ts: int = 0
     risk_on: bool = False
     portfolio_reentry_allowed_at: int = 0
+    recovery_entries_by_day: Dict[str, int] = field(default_factory=dict)
+    trades_by_day: Dict[str, int] = field(default_factory=dict)
+    soft_trades_by_day: Dict[str, int] = field(default_factory=dict)
+    buy_trades_by_day: Dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.start_ts == 0:
@@ -325,6 +471,10 @@ def load_state() -> BotState:
             start_ts=int(raw.get("start_ts", now_ms())),
             risk_on=bool(raw.get("risk_on", False)),
             portfolio_reentry_allowed_at=int(raw.get("portfolio_reentry_allowed_at", 0)),
+            recovery_entries_by_day={key: int(value) for key, value in raw.get("recovery_entries_by_day", {}).items()},
+            trades_by_day={key: int(value) for key, value in raw.get("trades_by_day", {}).items()},
+            soft_trades_by_day={key: int(value) for key, value in raw.get("soft_trades_by_day", {}).items()},
+            buy_trades_by_day={key: int(value) for key, value in raw.get("buy_trades_by_day", {}).items()},
         )
     except Exception as exc:
         logger.warning("Failed to load state.json: %s", exc)
@@ -392,6 +542,7 @@ class RoostooMomentumBot:
         self._consecutive_loop_failures = 0
         self._has_lock = False
         self.last_rebalance_ts = 0
+        self.last_risk_check_ts = 0
         self.session_start_ts = now_ms()
         signal.signal(signal.SIGINT, self._handle_stop)
         signal.signal(signal.SIGTERM, self._handle_stop)
@@ -710,6 +861,62 @@ class RoostooMomentumBot:
     def set_cooldown(self, pair: str, minutes: int) -> None:
         self.state.cooldown_until[pair] = now_ms() + minutes * 60_000
 
+    def prune_recovery_entry_counters(self) -> None:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        self.state.recovery_entries_by_day = {
+            day: count for day, count in self.state.recovery_entries_by_day.items() if day >= today
+        }
+        self.state.trades_by_day = {
+            day: count for day, count in self.state.trades_by_day.items() if day >= today
+        }
+        self.state.soft_trades_by_day = {
+            day: count for day, count in self.state.soft_trades_by_day.items() if day >= today
+        }
+        self.state.buy_trades_by_day = {
+            day: count for day, count in self.state.buy_trades_by_day.items() if day >= today
+        }
+
+    def today_trade_count(self) -> int:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        return self.state.trades_by_day.get(today, 0)
+
+    def today_soft_trade_count(self) -> int:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        return self.state.soft_trades_by_day.get(today, 0)
+
+    def today_buy_trade_count(self) -> int:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        return self.state.buy_trades_by_day.get(today, 0)
+
+    @staticmethod
+    def is_hard_risk_reason(reason: str) -> bool:
+        hard_tokens = ("stop_loss", "trailing_stop", "portfolio_drawdown", "flash_crash_defense")
+        return any(token in reason for token in hard_tokens)
+
+    def can_place_soft_trade(self) -> bool:
+        limit = max(self.cfg.daily_soft_trade_limit, 0)
+        return limit <= 0 or self.today_soft_trade_count() < limit
+
+    def can_place_new_entry(self) -> bool:
+        limit = max(self.cfg.daily_new_entry_limit, 0)
+        return limit <= 0 or self.today_buy_trade_count() < limit
+
+    def record_trade_activity(self, side: str, reason: str) -> None:
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        self.state.trades_by_day[today] = self.state.trades_by_day.get(today, 0) + 1
+        if side.upper() == "BUY":
+            self.state.buy_trades_by_day[today] = self.state.buy_trades_by_day.get(today, 0) + 1
+        if not self.is_hard_risk_reason(reason):
+            self.state.soft_trades_by_day[today] = self.state.soft_trades_by_day.get(today, 0) + 1
+
+    def can_place_recovery_entry(self, ts_ms: int) -> bool:
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(ts_ms / 1000.0))
+        return self.state.recovery_entries_by_day.get(day_key, 0) < self.cfg.recovery_daily_entry_limit
+
+    def record_recovery_entry(self, ts_ms: int) -> None:
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(ts_ms / 1000.0))
+        self.state.recovery_entries_by_day[day_key] = self.state.recovery_entries_by_day.get(day_key, 0) + 1
+
     def rebalance_notional_threshold(self, equity: float) -> float:
         return max(self.cfg.min_rebalance_notional, equity * self.cfg.rebalance_threshold)
 
@@ -743,10 +950,8 @@ class RoostooMomentumBot:
 
     def sell_quantity_for_position(self, pair: str, quantity: float, price: float) -> float:
         """
-        统一所有 SELL 路径的数量规整。
-        优先按持仓原始数量向下取整到交易精度，避免超卖；
-        若规整后达不到最小下单额，则返回 0。
-        """
+        缁熶竴鎵€鏈?SELL 璺緞鐨勬暟閲忚鏁淬€?        浼樺厛鎸夋寔浠撳師濮嬫暟閲忓悜涓嬪彇鏁村埌浜ゆ槗绮惧害锛岄伩鍏嶈秴鍗栵紱
+        鑻ヨ鏁村悗杈句笉鍒版渶灏忎笅鍗曢锛屽垯杩斿洖 0銆?        """
         return self.normalize_order_quantity(pair, quantity, price)
 
     def sell_quantity_for_fraction(self, pair: str, quantity: float, price: float, fraction: float) -> float:
@@ -896,11 +1101,13 @@ class RoostooMomentumBot:
         if not response.get("Success", False):
             logger.warning("Order failed: %s", response)
             return False
+        self.record_trade_activity(side, reason)
         logger.info("Order OK: %s %s qty=%.8f reason=%s", side, pair, quantity, reason)
         return True
 
     def build_position_meta(self, pair: str, quantity: float, price: float, score: float) -> PositionMeta:
         meta = self.position_meta(pair)
+        today = time.strftime("%Y-%m-%d", time.gmtime())
         if meta is None:
             meta = PositionMeta(
                 pair=pair,
@@ -910,6 +1117,7 @@ class RoostooMomentumBot:
                 last_trade_ts=now_ms(),
                 last_signal_score=score,
                 last_reason="recovered_from_balance",
+                entry_day=today,
             )
         meta.quantity = quantity
         meta.highest_price = max(meta.highest_price, price)
@@ -923,9 +1131,7 @@ class RoostooMomentumBot:
             targets: Dict[str, float],
     ) -> int:
         """
-        只有当 pair 不在 targets 或目标权重极小的时候，才累计计数。
-        一旦重新回到 targets，就清零。
-        """
+        鍙湁褰?pair 涓嶅湪 targets 鎴栫洰鏍囨潈閲嶆瀬灏忕殑鏃跺€欙紝鎵嶇疮璁¤鏁般€?        涓€鏃﹂噸鏂板洖鍒?targets锛屽氨娓呴浂銆?        """
         target_weight = float(targets.get(pair, 0.0))
         if target_weight > 1e-12:
             meta.not_in_targets_bars = 0
@@ -949,37 +1155,50 @@ class RoostooMomentumBot:
             targets: Dict[str, float],
     ) -> List[str]:
         reasons: List[str] = []
+        recovery_position = meta.last_reason == "recovery_reentry"
+        min_hold_minutes = float(getattr(self.cfg, 'min_hold_minutes', 180))
+        if recovery_position:
+            min_hold_minutes *= float(getattr(self.cfg, "recovery_min_hold_multiplier", 2.0))
+        min_hold_ms = int(min_hold_minutes * 60_000)
+        allow_soft_exit = now_ms() - meta.last_trade_ts >= min_hold_ms
+        same_day_entry = meta.entry_day == time.strftime("%Y-%m-%d", time.gmtime())
+        if getattr(self.cfg, "block_same_day_soft_exit", True) and same_day_entry:
+            allow_soft_exit = False
 
-        # 1) 价格型风控：始终立即执行，绝不延迟
+        # Price-based risk exits should always remain active.
         if price <= meta.entry_price * (1 - self.cfg.per_position_stop_loss):
             reasons.append("stop_loss")
         if price <= meta.highest_price * (1 - self.cfg.per_position_trailing_stop):
             reasons.append("trailing_stop")
 
-        # 2) 先更新 not_in_targets 计数
+        # Update out-of-target confirmation before considering soft exits.
         target_weight = float(targets.get(pair, 0.0))
         not_in_targets_count = self.update_not_in_targets_counter(meta, pair, targets)
         in_targets = target_weight > 1e-12
-        confirmed_not_in_targets = self.not_in_targets_confirmed(meta, confirm_bars=3)
+        confirm_bars = int(getattr(self.cfg, "recovery_not_in_targets_confirm_bars", 6)) if recovery_position else 3
+        confirmed_not_in_targets = self.not_in_targets_confirmed(meta, confirm_bars=confirm_bars)
 
-        # 3) score_decay 的处理分两种情况：
-        #    - 仍在 targets 内：保持原逻辑，立即执行
-        #    - 已不在 targets：必须等 not_in_targets 也确认后，才允许触发退出
-        score_decay = score < self.cfg.exit_score_threshold
+        # Soft exits wait for a minimum holding period to reduce fee drag.
+        exit_threshold = self.cfg.exit_score_threshold
+        if recovery_position:
+            exit_threshold -= float(getattr(self.cfg, "recovery_exit_score_grace", 0.08))
+        score_decay = allow_soft_exit and score < exit_threshold
 
         if in_targets:
             if score_decay:
                 reasons.append("score_decay")
         else:
-            if confirmed_not_in_targets:
+            if allow_soft_exit and confirmed_not_in_targets:
                 if score_decay:
                     reasons.append("score_decay")
                 reasons.append("not_in_targets")
             else:
                 logger.info(
-                    "Hold %s pending not_in_targets confirmation: %d/3 bars score_decay=%s",
+                    "Hold %s pending soft-exit confirmation: %d/%d bars hold_ok=%s score_decay=%s",
                     pair,
                     not_in_targets_count,
+                    confirm_bars,
+                    allow_soft_exit,
                     score_decay,
                 )
 
@@ -1002,9 +1221,7 @@ class RoostooMomentumBot:
             feature = features.get(pair)
             fresh_ok, fresh_reason = self.pair_freshness_status(pair)
 
-            # 没有 feature 或数据不 fresh 时：
-            # 1) 不做基于 score 的主动退出
-            # 2) 但仍保留价格型风控
+            # Without a fresh feature, keep only price-based protection.
             if feature is None or not fresh_ok:
                 prev_meta = self.position_meta(pair)
                 fallback_score = prev_meta.last_signal_score if prev_meta is not None else 0.0
@@ -1086,6 +1303,11 @@ class RoostooMomentumBot:
             reasons = self.exit_reasons(pair, meta, price, score, targets)
 
             if reasons:
+                soft_only_reasons = [reason for reason in reasons if not self.is_hard_risk_reason(reason)]
+                if soft_only_reasons and not self.can_place_soft_trade():
+                    meta.last_reason = "hold_soft_trade_cap"
+                    self.set_position_meta(meta)
+                    continue
                 unrealized_return = self.unrealized_return(meta.entry_price, price)
                 protected_profit = unrealized_return >= self.cfg.profit_protect_threshold
                 if "stop_loss" in reasons or "trailing_stop" in reasons:
@@ -1176,11 +1398,15 @@ class RoostooMomentumBot:
             price = self.pair_price(pair, tickers)
             if price <= 0:
                 continue
+            meta = self.position_meta(pair)
+            same_day_entry = meta is not None and meta.entry_day == time.strftime("%Y-%m-%d", time.gmtime())
 
             target_usd = portfolio.equity * targets.get(pair, 0.0)
             current_usd = portfolio.current_notional.get(pair, 0.0)
             trim_usd = current_usd - target_usd
             if trim_usd < rebalance_threshold:
+                continue
+            if getattr(self.cfg, "block_same_day_soft_exit", True) and same_day_entry and target_usd <= 0:
                 continue
 
             if target_usd <= 0:
@@ -1195,6 +1421,8 @@ class RoostooMomentumBot:
                 reason = "target_trim"
 
             if sell_quantity <= 0:
+                continue
+            if not self.can_place_soft_trade():
                 continue
 
             score = features.get(pair, {}).get("score", -999.0)
@@ -1225,7 +1453,11 @@ class RoostooMomentumBot:
                         self.set_cooldown(pair, self.cfg.cooldown_minutes)
 
     def record_buy_fill(self, pair: str, quantity: float, price: float, score: float) -> None:
+        self.record_buy_fill_with_reason(pair, quantity, price, score, "target_rebalance")
+
+    def record_buy_fill_with_reason(self, pair: str, quantity: float, price: float, score: float, reason: str) -> None:
         meta = self.position_meta(pair)
+        trade_day = time.strftime("%Y-%m-%d", time.gmtime())
         if meta is None:
             self.set_position_meta(
                 PositionMeta(
@@ -1235,7 +1467,9 @@ class RoostooMomentumBot:
                     highest_price=price,
                     last_trade_ts=now_ms(),
                     last_signal_score=score,
-                    last_reason="target_rebalance",
+                    last_reason=reason,
+                    recovery_trade_day=trade_day if reason == "recovery_reentry" else "",
+                    entry_day=trade_day,
                 )
             )
             return
@@ -1247,7 +1481,9 @@ class RoostooMomentumBot:
         meta.highest_price = max(meta.highest_price, price)
         meta.last_trade_ts = now_ms()
         meta.last_signal_score = score
-        meta.last_reason = "target_rebalance"
+        meta.last_reason = reason
+        meta.recovery_trade_day = trade_day if reason == "recovery_reentry" else meta.recovery_trade_day
+        meta.entry_day = trade_day
         self.set_position_meta(meta)
 
     def add_target_positions(
@@ -1256,6 +1492,7 @@ class RoostooMomentumBot:
             tickers: Dict[str, Any],
             features: Dict[str, Dict[str, float]],
             targets: Dict[str, float],
+            entry_modes: Dict[str, str],
             rebalance_threshold: float,
     ) -> None:
         for pair, weight in sorted(targets.items(), key=lambda item: item[1], reverse=True):
@@ -1292,9 +1529,93 @@ class RoostooMomentumBot:
                 continue
 
             score = feature["score"]
-            if self.submit_market_order(pair, "BUY", quantity, "target_rebalance", score, price):
-                self.record_buy_fill(pair, quantity, price, score)
+            entry_reason = entry_modes.get(pair, "target_rebalance")
+            if not self.can_place_soft_trade():
+                break
+            if not self.can_place_new_entry():
+                logger.info("Skip BUY %s because daily new-entry budget is exhausted.", pair)
+                break
+            if entry_reason == "recovery_reentry" and not self.can_place_recovery_entry(now_ms()):
+                logger.info("Skip recovery BUY %s because daily recovery entry limit is reached.", pair)
+                continue
+            if self.submit_market_order(pair, "BUY", quantity, entry_reason, score, price):
+                self.record_buy_fill_with_reason(pair, quantity, price, score, entry_reason)
+                if entry_reason == "recovery_reentry":
+                    self.record_recovery_entry(now_ms())
+                    self.set_cooldown(pair, self.cfg.recovery_entry_cooldown_minutes)
                 portfolio.usd_free -= quantity * price
+
+    def maybe_place_daily_activity_probe(
+            self,
+            portfolio: PortfolioSnapshot,
+            tickers: Dict[str, Any],
+            features: Dict[str, Dict[str, float]],
+            pair: Optional[str],
+    ) -> None:
+        if not self.cfg.daily_activity_enabled or not pair or self.today_trade_count() > 0:
+            return
+        if not self.can_place_soft_trade() or not self.can_place_new_entry():
+            return
+        if pair in portfolio.positions or self.in_cooldown(pair):
+            return
+        feature = features.get(pair)
+        if feature is None:
+            return
+        price = self.pair_price(pair, tickers)
+        if price <= 0:
+            return
+        usable_cash = max(0.0, portfolio.usd_free - portfolio.equity * self.cfg.cash_buffer)
+        if usable_cash <= 0:
+            return
+        probe_usd = min(usable_cash, portfolio.equity * self.cfg.daily_activity_probe_exposure)
+        quantity = self.quantity_for_notional(pair, probe_usd, price)
+        if quantity <= 0:
+            return
+        score = feature["score"]
+        if self.submit_market_order(pair, "BUY", quantity, "daily_activity_probe", score, price):
+            self.record_buy_fill_with_reason(pair, quantity, price, score, "daily_activity_probe")
+            self.set_cooldown(pair, self.cfg.daily_activity_entry_cooldown_minutes)
+            portfolio.usd_free -= quantity * price
+
+    def fast_shock_defense(
+            self,
+            portfolio: PortfolioSnapshot,
+            tickers: Dict[str, Any],
+    ) -> tuple[set[str], bool]:
+        skip_trim_pairs: set[str] = set()
+        triggered = False
+        lookback = max(int(getattr(self.cfg, "flash_crash_lookback_minutes", 5)), 3)
+        drop_threshold = float(getattr(self.cfg, "flash_crash_drop_threshold", -0.03))
+        rebound_threshold = float(getattr(self.cfg, "flash_crash_rebound_threshold", 0.008))
+        sell_fraction = float(getattr(self.cfg, "flash_crash_sell_fraction", 0.50))
+
+        for pair, quantity in list(portfolio.positions.items()):
+            series = self.history.get(pair)
+            if quantity <= 0 or not series or len(series) < lookback:
+                continue
+            prices = [float(entry.get("price", 0.0)) for entry in list(series)[-lookback:] if float(entry.get("price", 0.0)) > 0]
+            if len(prices) < 3:
+                continue
+            price = prices[-1]
+            recent_peak = max(prices)
+            recent_low = min(prices)
+            drop_from_peak = price / recent_peak - 1.0 if recent_peak > 0 else 0.0
+            rebound_from_low = price / recent_low - 1.0 if recent_low > 0 else 0.0
+            if drop_from_peak > drop_threshold or rebound_from_low >= rebound_threshold:
+                continue
+
+            sell_quantity = self.sell_quantity_for_fraction(pair, quantity, price, sell_fraction)
+            if sell_quantity <= 0:
+                continue
+            score = -999.0
+            if self.submit_market_order(pair, "SELL", sell_quantity, "flash_crash_defense", score, price):
+                skip_trim_pairs.add(pair)
+                triggered = True
+                if sell_quantity >= quantity * 0.999999:
+                    self.remove_position_meta(pair)
+                self.set_cooldown(pair, self.cfg.cooldown_minutes)
+
+        return skip_trim_pairs, triggered
 
     def exit_all_positions(self, positions: Dict[str, float], tickers: Dict[str, Any], reason: str) -> None:
         for pair, quantity in list(positions.items()):
@@ -1336,7 +1657,7 @@ class RoostooMomentumBot:
                 continue
 
             if ok:
-                # 只有当本次卖单基本等于可卖持仓时，才移除 meta
+                # 鍙湁褰撴湰娆″崠鍗曞熀鏈瓑浜庡彲鍗栨寔浠撴椂锛屾墠绉婚櫎 meta
                 if sell_quantity >= quantity * 0.999999:
                     self.remove_position_meta(pair)
                 self.set_cooldown(pair, self.cfg.cooldown_minutes)
@@ -1398,36 +1719,62 @@ class RoostooMomentumBot:
     def rebalance_once(self) -> None:
         now = time.time()
 
-        # 1. 每分钟都更新市场数据
+        # 1. 姣忓垎閽熼兘鏇存柊甯傚満鏁版嵁
         tickers = self.fetch_all_tickers()
         self.update_history(tickers)
 
         portfolio = self.build_portfolio_snapshot(tickers)
         self.capture_portfolio_state(portfolio, tickers)
+        self.prune_recovery_entry_counters()
 
         skip_trim_pairs: set[str] = set()
         allow_new_entries = now_ms() >= self.state.portfolio_reentry_allowed_at
+        shock_skip_pairs, shock_triggered = self.fast_shock_defense(portfolio, tickers)
+        if shock_skip_pairs:
+            skip_trim_pairs |= shock_skip_pairs
+            allow_new_entries = False
+            self.state.portfolio_reentry_allowed_at = max(
+                self.state.portfolio_reentry_allowed_at,
+                now_ms() + self.cfg.cooldown_minutes * 60_000,
+            )
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.sync_position_meta(portfolio.positions, tickers)
+            if shock_triggered:
+                logger.warning("Fast shock defense triggered for pairs: %s", sorted(shock_skip_pairs))
+
         if portfolio.drawdown >= self.cfg.max_portfolio_drawdown and portfolio.positions:
-            logger.warning("Portfolio drawdown throttle triggered. Reduce risk and skip new buys this round.")
+            dd_sell_fraction, dd_cooldown_minutes = portfolio_drawdown_response(self.cfg, portfolio.drawdown)
+            logger.warning(
+                "Portfolio drawdown throttle triggered. drawdown=%.4f sell_fraction=%.2f cooldown_minutes=%d",
+                portfolio.drawdown,
+                dd_sell_fraction,
+                dd_cooldown_minutes,
+            )
             skip_trim_pairs |= self.reduce_positions(
                 portfolio.positions,
                 tickers,
                 "portfolio_drawdown",
-                sell_fraction=0.50,
+                sell_fraction=dd_sell_fraction,
             )
             allow_new_entries = False
             self.state.portfolio_reentry_allowed_at = max(
                 self.state.portfolio_reentry_allowed_at,
-                now_ms() + self.cfg.portfolio_drawdown_cooldown_minutes * 60_000,
+                now_ms() + dd_cooldown_minutes * 60_000,
             )
             portfolio = self.build_portfolio_snapshot(tickers)
             self.sync_position_meta(portfolio.positions, tickers)
+            if not portfolio.positions:
+                self.state.portfolio_reentry_allowed_at = min(
+                    self.state.portfolio_reentry_allowed_at,
+                    now_ms() + self.cfg.empty_book_reentry_minutes * 60_000,
+                )
 
         signals = self.strategy.generate_signals(
             history=self.history,
             trade_pairs=self.trade_pairs,
             positions=portfolio.positions,
             prev_risk_on=self.state.risk_on,
+            current_drawdown=portfolio.drawdown,
         )
         self.state.risk_on = signals["risk_on"]
         self.log_signal_snapshot(signals)
@@ -1488,14 +1835,14 @@ class RoostooMomentumBot:
             self.persist_runtime_state()
             return
 
-        # trade cooldown
-        cooldown_seconds = self.cfg.cooldown_minutes * 60
-        if now - self.last_rebalance_ts < cooldown_seconds:
-            logger.info("Trading cooldown active, skip orders only.")
+        full_rebalance_due = (now - self.last_rebalance_ts) >= self.cfg.rebalance_minutes * 60
+        risk_check_due = (now - self.last_risk_check_ts) >= self.cfg.risk_check_minutes * 60
+        if not full_rebalance_due and not risk_check_due:
+            logger.info("No risk check or full rebalance due yet.")
             self.persist_runtime_state()
             return
 
-        # 3. 真正下单
+        # 3. 鐪熸涓嬪崟
         skip_trim_pairs |= self.manage_existing_positions(
             portfolio.positions,
             tickers,
@@ -1503,37 +1850,49 @@ class RoostooMomentumBot:
             signals["weights"],
         )
 
-        portfolio = self.build_portfolio_snapshot(tickers)
-        self.sync_position_meta(portfolio.positions, tickers)
-        rebalance_threshold = self.rebalance_notional_threshold(portfolio.equity)
-        self.trim_positions(
-            portfolio,
-            tickers,
-            signals["features"],
-            signals["weights"],
-            rebalance_threshold,
-            skip_pairs=skip_trim_pairs,
-        )
-
-        portfolio = self.build_portfolio_snapshot(tickers)
-        self.sync_position_meta(portfolio.positions, tickers)
-        if allow_new_entries:
-            self.add_target_positions(
+        if full_rebalance_due:
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.sync_position_meta(portfolio.positions, tickers)
+            rebalance_threshold = self.rebalance_notional_threshold(portfolio.equity)
+            self.trim_positions(
                 portfolio,
                 tickers,
                 signals["features"],
                 signals["weights"],
                 rebalance_threshold,
-            )
-        else:
-            remaining_ms = max(0, self.state.portfolio_reentry_allowed_at - now_ms())
-            logger.info(
-                "Skip new buys while portfolio drawdown cooldown is active. Remaining %.1f hours",
-                remaining_ms / 3_600_000,
+                skip_pairs=skip_trim_pairs,
             )
 
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.sync_position_meta(portfolio.positions, tickers)
+            if allow_new_entries:
+                self.add_target_positions(
+                    portfolio,
+                    tickers,
+                    signals["features"],
+                    signals["weights"],
+                    signals.get("entry_modes", {}),
+                    rebalance_threshold,
+                )
+            else:
+                remaining_ms = max(0, self.state.portfolio_reentry_allowed_at - now_ms())
+                logger.info(
+                    "Skip new buys while portfolio drawdown cooldown is active. Remaining %.1f hours",
+                    remaining_ms / 3_600_000,
+                )
+            portfolio = self.build_portfolio_snapshot(tickers)
+            self.maybe_place_daily_activity_probe(
+                portfolio,
+                tickers,
+                signals["features"],
+                signals.get("daily_activity_probe"),
+            )
+            self.last_rebalance_ts = now
+        else:
+            logger.info("Risk-check cycle only: managed exits without full rebalance.")
+
         self.persist_runtime_state()
-        self.last_rebalance_ts = now
+        self.last_risk_check_ts = now
 
     def run_forever(self) -> None:
         self.bootstrap()
@@ -1581,3 +1940,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
