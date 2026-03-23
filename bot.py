@@ -761,11 +761,13 @@ class RoostooMomentumBot:
 
     def get_wallet(self) -> Dict[str, Dict[str, float]]:
         response = self.client.balance()
+        logger.info("RAW BALANCE RESPONSE: %s", response)
         if not response.get("Success", False):
             raise RuntimeError(f"Balance fetch failed: {response}")
         wallet: Dict[str, Dict[str, float]] = {}
         for coin, value in response.get("Wallet", {}).items():
             wallet[coin] = {"Free": safe_float(value.get("Free")), "Lock": safe_float(value.get("Lock"))}
+        logger.info("PARSED WALLET: %s", wallet)
         return wallet
 
     def realized_positions(self, wallet: Dict[str, Dict[str, float]]) -> Dict[str, float]:
