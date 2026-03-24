@@ -121,6 +121,11 @@ class Config:
     loop_error_backoff_cap_seconds: int
     cancel_all_on_start: bool
     dry_run: bool
+    execution_preference: str
+    maker_min_notional: float
+    maker_max_wait_seconds: int
+    maker_poll_seconds: float
+    maker_fallback_market: bool
     max_turnover_per_rebalance: float
     range_entry_exposure: float
     range_keep_exposure: float
@@ -159,6 +164,8 @@ class Config:
     rebound_state_score_boost: float
     failed_rebound_score_penalty: float
     range_chop_score_penalty: float
+    preferred_assets: str
+    blocked_assets: str
     daily_activity_enabled: bool
     daily_activity_probe_exposure: float
     daily_activity_min_confidence: float
@@ -193,22 +200,22 @@ class Config:
             trade_log_csv=log_dir / "trades.csv",
             portfolio_log_csv=log_dir / "portfolio.csv",
             signal_log_csv=log_dir / "signals.csv",
-            top_n=int(os.getenv("TOP_N", "4")),
-            rebalance_minutes=int(os.getenv("REBALANCE_MINUTES", "30")),
-            risk_check_minutes=int(os.getenv("RISK_CHECK_MINUTES", "15")),
-            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.72")),
-            max_single_weight=float(os.getenv("MAX_SINGLE_WEIGHT", "0.28")),
-            min_effective_weight=float(os.getenv("MIN_EFFECTIVE_WEIGHT", "0.07")),
-            cash_buffer=float(os.getenv("CASH_BUFFER", "0.25")),
-            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.68")),
-            exit_score_threshold=float(os.getenv("EXIT_SCORE_THRESHOLD", "0.12")),
-            entry_confidence_threshold=float(os.getenv("ENTRY_CONFIDENCE_THRESHOLD", "0.55")),
-            hold_confidence_threshold=float(os.getenv("HOLD_CONFIDENCE_THRESHOLD", "0.30")),
-            rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.03")),
-            min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "25")),
-            spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.006")),
-            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "120000")),
-            max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.05")),
+            top_n=int(os.getenv("TOP_N", "5")),
+            rebalance_minutes=int(os.getenv("REBALANCE_MINUTES", "180")),
+            risk_check_minutes=int(os.getenv("RISK_CHECK_MINUTES", "60")),
+            target_gross_exposure=float(os.getenv("TARGET_GROSS_EXPOSURE", "0.86")),
+            max_single_weight=float(os.getenv("MAX_SINGLE_WEIGHT", "0.24")),
+            min_effective_weight=float(os.getenv("MIN_EFFECTIVE_WEIGHT", "0.06")),
+            cash_buffer=float(os.getenv("CASH_BUFFER", "0.10")),
+            entry_score_threshold=float(os.getenv("ENTRY_SCORE_THRESHOLD", "0.76")),
+            exit_score_threshold=float(os.getenv("EXIT_SCORE_THRESHOLD", "0.05")),
+            entry_confidence_threshold=float(os.getenv("ENTRY_CONFIDENCE_THRESHOLD", "0.60")),
+            hold_confidence_threshold=float(os.getenv("HOLD_CONFIDENCE_THRESHOLD", "0.24")),
+            rebalance_threshold=float(os.getenv("REBALANCE_THRESHOLD", "0.05")),
+            min_rebalance_notional=float(os.getenv("MIN_REBALANCE_NOTIONAL", "100")),
+            spread_threshold=float(os.getenv("SPREAD_THRESHOLD", "0.005")),
+            min_24h_dollar_vol=float(os.getenv("MIN_24H_DOLLAR_VOL", "400000")),
+            max_pump_distance=float(os.getenv("MAX_PUMP_DISTANCE", "0.045")),
             market_median_60m_threshold=float(os.getenv("MARKET_MEDIAN_60M_THRESHOLD", "0.0005")),
             market_up_ratio_threshold=float(os.getenv("MARKET_UP_RATIO_THRESHOLD", "0.52")),
             regime_exit_median_60m_threshold=float(os.getenv("REGIME_EXIT_MEDIAN_60M_THRESHOLD", "0.0005")),
@@ -217,7 +224,7 @@ class Config:
             regime_exit_positive_score_ratio_threshold=float(os.getenv("REGIME_EXIT_POSITIVE_SCORE_RATIO_THRESHOLD", "0.42")),
             vol_floor=float(os.getenv("VOL_FLOOR", "0.004")),
             vol_cap=float(os.getenv("VOL_CAP", "0.08")),
-            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.12")),
+            holding_score_bonus=float(os.getenv("HOLDING_SCORE_BONUS", "0.18")),
             per_position_stop_loss=float(os.getenv("PER_POSITION_STOP_LOSS", "0.06")),
             risk_data_frequency=os.getenv("RISK_DATA_FREQUENCY", "raw").strip().lower(),
             risk_min_periods=int(os.getenv("RISK_MIN_PERIODS", "60")),
@@ -230,10 +237,10 @@ class Config:
             risk_vol_score_weight=float(os.getenv("RISK_VOL_SCORE_WEIGHT", "0.5")),
             risk_corr_score_weight=float(os.getenv("RISK_CORR_SCORE_WEIGHT", "0.5")),
             risk_on_exposure_multiplier=float(os.getenv("RISK_ON_EXPOSURE_MULTIPLIER", "1.0")),
-            neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.7")),
-            risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.35")),
-            risk_on_exposure_floor=float(os.getenv("RISK_ON_EXPOSURE_FLOOR", "0.80")),
-            neutral_exposure_floor=float(os.getenv("NEUTRAL_EXPOSURE_FLOOR", "0.45")),
+            neutral_exposure_multiplier=float(os.getenv("NEUTRAL_EXPOSURE_MULTIPLIER", "0.82")),
+            risk_off_exposure_multiplier=float(os.getenv("RISK_OFF_EXPOSURE_MULTIPLIER", "0.55")),
+            risk_on_exposure_floor=float(os.getenv("RISK_ON_EXPOSURE_FLOOR", "0.90")),
+            neutral_exposure_floor=float(os.getenv("NEUTRAL_EXPOSURE_FLOOR", "0.60")),
             enable_volatility_targeting=env_bool("ENABLE_VOLATILITY_TARGETING", True),
             target_portfolio_volatility=float(os.getenv("TARGET_PORTFOLIO_VOLATILITY", "0.020")),
             min_vol_target_scale=float(os.getenv("MIN_VOL_TARGET_SCALE", "0.35")),
@@ -253,7 +260,7 @@ class Config:
             diversification_core_asset_multiplier=float(
                 os.getenv("DIVERSIFICATION_CORE_ASSET_MULTIPLIER", "1.15")
             ),
-            diversification_core_assets=os.getenv("DIVERSIFICATION_CORE_ASSETS", "BTC,ETH"),
+            diversification_core_assets=os.getenv("DIVERSIFICATION_CORE_ASSETS", "BTC,ETH,SOL,BNB,FET,TAO"),
             high_vol_feature_cutoff_multiplier=float(
                 os.getenv("HIGH_VOL_FEATURE_CUTOFF_MULTIPLIER", "0.85")
             ),
@@ -261,14 +268,14 @@ class Config:
                 os.getenv("HIGH_VOL_FEATURE_WEIGHT_MULTIPLIER", "0.80")
             ),
             per_position_trailing_stop=float(os.getenv("PER_POSITION_TRAILING_STOP", "0.06")),
-            max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.10")),
-            cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "15")),
-            min_hold_minutes=int(os.getenv("MIN_HOLD_MINUTES", "240")),
-            portfolio_drawdown_cooldown_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_MINUTES", "1440")),
-            portfolio_drawdown_cooldown_floor_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_FLOOR_MINUTES", "1440")),
-            portfolio_drawdown_sell_floor=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_FLOOR", "0.50")),
-            portfolio_drawdown_sell_cap=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_CAP", "0.50")),
-            profit_protect_threshold=float(os.getenv("PROFIT_PROTECT_THRESHOLD", "0.10")),
+            max_portfolio_drawdown=float(os.getenv("MAX_PORTFOLIO_DRAWDOWN", "0.12")),
+            cooldown_minutes=int(os.getenv("COOLDOWN_MINUTES", "30")),
+            min_hold_minutes=int(os.getenv("MIN_HOLD_MINUTES", "480")),
+            portfolio_drawdown_cooldown_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_MINUTES", "240")),
+            portfolio_drawdown_cooldown_floor_minutes=int(os.getenv("PORTFOLIO_DRAWDOWN_COOLDOWN_FLOOR_MINUTES", "120")),
+            portfolio_drawdown_sell_floor=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_FLOOR", "0.15")),
+            portfolio_drawdown_sell_cap=float(os.getenv("PORTFOLIO_DRAWDOWN_SELL_CAP", "0.30")),
+            profit_protect_threshold=float(os.getenv("PROFIT_PROTECT_THRESHOLD", "0.08")),
             profit_protect_score_decay_fraction=float(os.getenv("PROFIT_PROTECT_SCORE_DECAY_FRACTION", "0.18")),
             profit_protect_not_in_targets_fraction=float(os.getenv("PROFIT_PROTECT_NOT_IN_TARGETS_FRACTION", "0.25")),
             startup_warmup_minutes=int(os.getenv("STARTUP_WARMUP_MINUTES", "30")),
@@ -282,7 +289,12 @@ class Config:
             loop_error_backoff_cap_seconds=int(os.getenv("LOOP_ERROR_BACKOFF_CAP_SECONDS", "900")),
             cancel_all_on_start=env_bool("CANCEL_ALL_ON_START", False),
             dry_run=env_bool("DRY_RUN", False),
-            max_turnover_per_rebalance=float(os.getenv("MAX_TURNOVER_PER_REBALANCE", "0.60")),
+            execution_preference=os.getenv("EXECUTION_PREFERENCE", "maker_first").strip().lower(),
+            maker_min_notional=float(os.getenv("MAKER_MIN_NOTIONAL", "500")),
+            maker_max_wait_seconds=int(os.getenv("MAKER_MAX_WAIT_SECONDS", "20")),
+            maker_poll_seconds=float(os.getenv("MAKER_POLL_SECONDS", "2")),
+            maker_fallback_market=env_bool("MAKER_FALLBACK_MARKET", True),
+            max_turnover_per_rebalance=float(os.getenv("MAX_TURNOVER_PER_REBALANCE", "0.30")),
             range_entry_exposure=float(os.getenv("RANGE_ENTRY_EXPOSURE", "0.12")),
             range_keep_exposure=float(os.getenv("RANGE_KEEP_EXPOSURE", "0.10")),
             range_max_positions=int(os.getenv("RANGE_MAX_POSITIONS", "2")),
@@ -297,7 +309,7 @@ class Config:
             recovery_entry_confidence_relaxation=float(os.getenv("RECOVERY_ENTRY_CONFIDENCE_RELAXATION", "0.06")),
             recovery_reentry_exposure=float(os.getenv("RECOVERY_REENTRY_EXPOSURE", "0.08")),
             recovery_max_positions=int(os.getenv("RECOVERY_MAX_POSITIONS", "2")),
-            empty_book_reentry_minutes=int(os.getenv("EMPTY_BOOK_REENTRY_MINUTES", "120")),
+            empty_book_reentry_minutes=int(os.getenv("EMPTY_BOOK_REENTRY_MINUTES", "90")),
             recovery_rebound_confirmation=float(os.getenv("RECOVERY_REBOUND_CONFIRMATION", "0.008")),
             recovery_pullback_threshold=float(os.getenv("RECOVERY_PULLBACK_THRESHOLD", "-0.025")),
             recovery_volume_confirmation_floor=float(os.getenv("RECOVERY_VOLUME_CONFIRMATION_FLOOR", "0.0")),
@@ -307,25 +319,27 @@ class Config:
             recovery_not_in_targets_confirm_bars=int(os.getenv("RECOVERY_NOT_IN_TARGETS_CONFIRM_BARS", "6")),
             recovery_daily_entry_limit=int(os.getenv("RECOVERY_DAILY_ENTRY_LIMIT", "1")),
             recovery_entry_cooldown_minutes=int(os.getenv("RECOVERY_ENTRY_COOLDOWN_MINUTES", "720")),
-            block_same_day_soft_exit=env_bool("BLOCK_SAME_DAY_SOFT_EXIT", False),
+            block_same_day_soft_exit=env_bool("BLOCK_SAME_DAY_SOFT_EXIT", True),
             portfolio_min_positions=int(os.getenv("PORTFOLIO_MIN_POSITIONS", "4")),
-            portfolio_max_positions=int(os.getenv("PORTFOLIO_MAX_POSITIONS", "5")),
-            liquid_asset_volume_threshold=float(os.getenv("LIQUID_ASSET_VOLUME_THRESHOLD", "400000")),
-            satellite_asset_volume_threshold=float(os.getenv("SATELLITE_ASSET_VOLUME_THRESHOLD", "180000")),
-            core_bucket_weight_cap=float(os.getenv("CORE_BUCKET_WEIGHT_CAP", "0.58")),
-            liquid_bucket_weight_cap=float(os.getenv("LIQUID_BUCKET_WEIGHT_CAP", "0.32")),
-            satellite_bucket_weight_cap=float(os.getenv("SATELLITE_BUCKET_WEIGHT_CAP", "0.10")),
+            portfolio_max_positions=int(os.getenv("PORTFOLIO_MAX_POSITIONS", "6")),
+            liquid_asset_volume_threshold=float(os.getenv("LIQUID_ASSET_VOLUME_THRESHOLD", "600000")),
+            satellite_asset_volume_threshold=float(os.getenv("SATELLITE_ASSET_VOLUME_THRESHOLD", "1000000")),
+            core_bucket_weight_cap=float(os.getenv("CORE_BUCKET_WEIGHT_CAP", "0.70")),
+            liquid_bucket_weight_cap=float(os.getenv("LIQUID_BUCKET_WEIGHT_CAP", "0.28")),
+            satellite_bucket_weight_cap=float(os.getenv("SATELLITE_BUCKET_WEIGHT_CAP", "0.05")),
             trend_state_score_boost=float(os.getenv("TREND_STATE_SCORE_BOOST", "0.08")),
             breakout_state_score_boost=float(os.getenv("BREAKOUT_STATE_SCORE_BOOST", "0.05")),
             rebound_state_score_boost=float(os.getenv("REBOUND_STATE_SCORE_BOOST", "0.02")),
             failed_rebound_score_penalty=float(os.getenv("FAILED_REBOUND_SCORE_PENALTY", "0.24")),
             range_chop_score_penalty=float(os.getenv("RANGE_CHOP_SCORE_PENALTY", "0.16")),
-            daily_activity_enabled=env_bool("DAILY_ACTIVITY_ENABLED", True),
+            preferred_assets=os.getenv("PREFERRED_ASSETS", "BTC,ETH,SOL,BNB,FET,TAO,XRP,LINK,XLM,ADA,TRX,PAXG,SUI,NEAR,DOGE,AAVE"),
+            blocked_assets=os.getenv("BLOCKED_ASSETS", "OPEN,WLFI,TUT,PENDLE,DOT,AVAX"),
+            daily_activity_enabled=env_bool("DAILY_ACTIVITY_ENABLED", False),
             daily_activity_probe_exposure=float(os.getenv("DAILY_ACTIVITY_PROBE_EXPOSURE", "0.03")),
             daily_activity_min_confidence=float(os.getenv("DAILY_ACTIVITY_MIN_CONFIDENCE", "0.55")),
             daily_activity_entry_cooldown_minutes=int(os.getenv("DAILY_ACTIVITY_ENTRY_COOLDOWN_MINUTES", "360")),
-            daily_soft_trade_limit=int(os.getenv("DAILY_SOFT_TRADE_LIMIT", "8")),
-            daily_new_entry_limit=int(os.getenv("DAILY_NEW_ENTRY_LIMIT", "3")),
+            daily_soft_trade_limit=int(os.getenv("DAILY_SOFT_TRADE_LIMIT", "4")),
+            daily_new_entry_limit=int(os.getenv("DAILY_NEW_ENTRY_LIMIT", "2")),
             flash_crash_lookback_minutes=int(os.getenv("FLASH_CRASH_LOOKBACK_MINUTES", "5")),
             flash_crash_drop_threshold=float(os.getenv("FLASH_CRASH_DROP_THRESHOLD", "-0.03")),
             flash_crash_rebound_threshold=float(os.getenv("FLASH_CRASH_REBOUND_THRESHOLD", "0.008")),
@@ -380,6 +394,11 @@ def portfolio_drawdown_response(cfg: Config, drawdown: float) -> tuple[float, in
 def round_down(value: float, decimals: int) -> float:
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
+
+
+def round_up(value: float, decimals: int) -> float:
+    factor = 10 ** decimals
+    return math.ceil(value * factor) / factor
 
 
 def append_csv(path: Path, headers: List[str], row: Dict[str, Any]) -> None:
@@ -722,7 +741,7 @@ class RoostooMomentumBot:
         )
 
     def freshness_check_pairs(self) -> List[str]:
-        preferred = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "SUI/USD"]
+        preferred = ["BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD", "FET/USD", "SUI/USD"]
         pairs = [pair for pair in preferred if pair in self.trade_pairs]
         if len(pairs) >= 3:
             return pairs[:5]
@@ -1055,6 +1074,87 @@ class RoostooMomentumBot:
             },
         )
 
+    @staticmethod
+    def extract_order_detail(response: Dict[str, Any]) -> Dict[str, Any]:
+        detail = response.get("OrderDetail")
+        if isinstance(detail, dict) and detail:
+            return detail
+        matched = response.get("OrderMatched")
+        if isinstance(matched, list) and matched:
+            first = matched[0]
+            if isinstance(first, dict):
+                return first
+        return {}
+
+    @staticmethod
+    def order_filled_quantity(detail: Dict[str, Any]) -> float:
+        return safe_float(detail.get("FilledQuantity", detail.get("Quantity", 0.0)))
+
+    @staticmethod
+    def order_average_price(detail: Dict[str, Any], fallback_price: float) -> float:
+        return safe_float(detail.get("FilledAverPrice", detail.get("Price", fallback_price)), fallback_price)
+
+    def latest_market_snapshot(self, pair: str, fallback_price: float) -> Dict[str, float]:
+        series = self.history.get(pair)
+        if not series:
+            return {"bid": fallback_price, "ask": fallback_price}
+        row = series[-1]
+        bid = safe_float(row.get("bid"), fallback_price)
+        ask = safe_float(row.get("ask"), fallback_price)
+        return {
+            "bid": bid if bid > 0 else fallback_price,
+            "ask": ask if ask > 0 else fallback_price,
+        }
+
+    def use_maker_execution(self, pair: str, reason: str, quantity: float, expected_price: float) -> bool:
+        if self.cfg.execution_preference != "maker_first":
+            return False
+        if self.is_hard_risk_reason(reason):
+            return False
+        if quantity <= 0 or expected_price <= 0:
+            return False
+        notional = quantity * expected_price
+        if notional < self.cfg.maker_min_notional:
+            return False
+        return pair in self.trade_pairs
+
+    def maker_limit_price(self, pair: str, side: str, expected_price: float) -> float:
+        market = self.latest_market_snapshot(pair, expected_price)
+        side_upper = side.upper()
+        price = market["bid"] if side_upper == "BUY" else market["ask"]
+        rules = self.trade_pairs.get(pair, {})
+        price_precision = int(rules.get("PricePrecision", 4))
+        rounded = round_down(max(price, 1e-12), price_precision) if side_upper == "BUY" else round_up(max(price, 1e-12), price_precision)
+        return max(rounded, 10 ** (-price_precision))
+
+    def wait_for_order_fill(self, pair: str, order_id: str, fallback_price: float) -> Dict[str, Any]:
+        deadline = time.time() + max(self.cfg.maker_max_wait_seconds, 1)
+        last_response: Dict[str, Any] = {"Success": False, "ErrMsg": "maker_wait_timeout", "OrderMatched": []}
+        while time.time() < deadline:
+            try:
+                response = self.client.query_order(order_id=str(order_id))
+            except Exception as exc:
+                last_response = {"Success": False, "ErrMsg": f"query_order_failed:{exc}", "OrderMatched": []}
+                time.sleep(max(self.cfg.maker_poll_seconds, 0.5))
+                continue
+            detail = self.extract_order_detail(response)
+            if not detail:
+                last_response = response
+                time.sleep(max(self.cfg.maker_poll_seconds, 0.5))
+                continue
+            last_response = response
+            status = str(detail.get("Status", "")).upper()
+            filled_quantity = self.order_filled_quantity(detail)
+            request_quantity = safe_float(detail.get("Quantity"), 0.0)
+            if status == "FILLED" or (
+                request_quantity > 0 and filled_quantity >= request_quantity * 0.999999
+            ):
+                return response
+            if status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                return response
+            time.sleep(max(self.cfg.maker_poll_seconds, 0.5))
+        return last_response
+
     def submit_market_order(
         self,
         pair: str,
@@ -1067,22 +1167,77 @@ class RoostooMomentumBot:
         if quantity <= 0:
             return False
         if self.cfg.dry_run:
+            dry_role = "MAKER" if self.use_maker_execution(pair, reason, quantity, expected_price) else "TAKER"
+            dry_type = "LIMIT" if dry_role == "MAKER" else "MARKET"
             fake_response = {
                 "Success": True,
                 "ErrMsg": "",
                 "OrderDetail": {
                     "OrderID": f"dryrun-{now_ms()}",
                     "Status": "FILLED",
-                    "Role": "TAKER",
+                    "Role": dry_role,
+                    "Type": dry_type,
                     "Quantity": quantity,
                     "FilledQuantity": quantity,
                     "FilledAverPrice": expected_price,
-                    "CommissionPercent": 0.001,
+                    "CommissionPercent": 0.0005 if dry_role == "MAKER" else 0.001,
                 },
             }
             self.log_trade(pair, side, quantity, reason + "|dry_run", expected_price, fake_response, signal_score)
             logger.info("[DRY_RUN] %s %s qty=%.8f reason=%s", side, pair, quantity, reason)
             return True
+        if self.use_maker_execution(pair, reason, quantity, expected_price):
+            limit_price = self.maker_limit_price(pair, side, expected_price)
+            try:
+                response = self.client.place_limit_order(pair, side, quantity, limit_price)
+            except UnknownOrderStateError as exc:
+                failure_response = {"Success": False, "ErrMsg": str(exc), "OrderDetail": {}}
+                self.log_trade(pair, side, quantity, reason + "|limit_unknown_state", expected_price, failure_response, signal_score)
+                self._pause_until_ms = max(self._pause_until_ms, now_ms() + self.cfg.order_failure_pause_seconds * 1000)
+                logger.error(
+                    "Limit order state unknown for %s %s qty=%.8f. Trading paused for %ss.",
+                    side,
+                    pair,
+                    quantity,
+                    self.cfg.order_failure_pause_seconds,
+                )
+                raise
+            self.log_trade(pair, side, quantity, reason + "|limit_submit", expected_price, response, signal_score)
+            detail = self.extract_order_detail(response)
+            if not response.get("Success", False):
+                logger.warning("Limit order failed, fallback to market path: %s", response)
+            else:
+                order_id = detail.get("OrderID")
+                if order_id:
+                    final_response = self.wait_for_order_fill(pair, str(order_id), expected_price)
+                    final_detail = self.extract_order_detail(final_response)
+                    filled_quantity = self.order_filled_quantity(final_detail)
+                    status = str(final_detail.get("Status", detail.get("Status", ""))).upper()
+                    if status == "FILLED" and filled_quantity >= quantity * 0.999999:
+                        self.log_trade(pair, side, quantity, reason + "|maker_filled", expected_price, final_response, signal_score)
+                        self.record_trade_activity(side, reason)
+                        logger.info("Maker order filled: %s %s qty=%.8f reason=%s", side, pair, quantity, reason)
+                        return True
+                    remaining_quantity = self.normalize_order_quantity(pair, max(quantity - filled_quantity, 0.0), expected_price)
+                    try:
+                        cancel_response = self.client.cancel_order(order_id=str(order_id))
+                        self.log_trade(pair, side, quantity, reason + "|limit_cancel", expected_price, cancel_response, signal_score)
+                    except Exception as exc:
+                        logger.warning("Cancel limit order failed for %s %s order_id=%s: %s", side, pair, order_id, exc)
+                    if remaining_quantity <= 0:
+                        self.record_trade_activity(side, reason)
+                        logger.info("Maker order mostly filled before cancel: %s %s qty=%.8f reason=%s", side, pair, quantity, reason)
+                        return True
+                    if not self.cfg.maker_fallback_market:
+                        logger.warning(
+                            "Maker order not fully filled and market fallback disabled: %s %s remaining=%.8f status=%s",
+                            side,
+                            pair,
+                            remaining_quantity,
+                            status,
+                        )
+                        return False
+                    quantity = remaining_quantity
         try:
             response = self.client.place_market_order(pair, side, quantity)
         except UnknownOrderStateError as exc:

@@ -285,9 +285,24 @@ class AlphaModel:
         self.mu_model = MuModelWrapper(
             os.getenv("MU_MODEL_PATH", str(repo_root / "artifacts" / "mu_xgb_model.json")),
             os.getenv("MU_MODEL_META_PATH", str(repo_root / "artifacts" / "mu_xgb_model.meta.json")),
-            required=os.getenv("MU_MODEL_REQUIRED", "true").strip().lower() == "true",
+            required=os.getenv("MU_MODEL_REQUIRED", "false").strip().lower() == "true",
         )
         self.directional_filter = DirectionalRegimeFilter([])
+        self.core_assets = {
+            item.strip().upper()
+            for item in getattr(self.cfg, "diversification_core_assets", "BTC,ETH").split(",")
+            if item.strip()
+        }
+        self.preferred_assets = {
+            item.strip().upper()
+            for item in getattr(self.cfg, "preferred_assets", "").split(",")
+            if item.strip()
+        }
+        self.blocked_assets = {
+            item.strip().upper()
+            for item in getattr(self.cfg, "blocked_assets", "").split(",")
+            if item.strip()
+        }
 
     def trend_efficiency(self, prices: List[float], lookback: int) -> float:
         if len(prices) <= lookback:
@@ -312,6 +327,11 @@ class AlphaModel:
         eligible_pairs: List[str] = []
         for pair, series in history.items():
             if pair not in trade_pairs or len(series) < self.cfg.min_history:
+                continue
+            base_symbol = pair.split("/")[0].upper()
+            if base_symbol in self.blocked_assets:
+                continue
+            if self.preferred_assets and base_symbol not in self.preferred_assets:
                 continue
             prices = [float(entry["price"]) for entry in series]
             if len(prices) < 20:
@@ -375,7 +395,10 @@ class AlphaModel:
                 "recovery_after_drawdown20": drawdown_recovery_score(prices, 20),
             }
             features[pair] = feature
-            if spread <= self.cfg.spread_threshold and current_volume >= self.cfg.min_24h_dollar_vol:
+            min_volume_threshold = self.cfg.min_24h_dollar_vol
+            if base_symbol not in self.core_assets:
+                min_volume_threshold = max(min_volume_threshold, getattr(self.cfg, "liquid_asset_volume_threshold", min_volume_threshold))
+            if spread <= self.cfg.spread_threshold and current_volume >= min_volume_threshold:
                 eligible_pairs.append(pair)
         return {pair: features[pair] for pair in eligible_pairs}
 
@@ -402,9 +425,9 @@ class AlphaModel:
         for pair in pairs:
             feature = features[pair]
             signal_map[pair] = {
-                "multi_horizon_momentum": 0.20 * zscore(feature["ret15"], sections["ret15"]) + 0.25 * zscore(feature["ret30"], sections["ret30"]) + 0.25 * zscore(feature["ret60"], sections["ret60"]) + 0.30 * zscore(feature["ret120"], sections["ret120"]),
-                "volatility_breakout": 0.55 * zscore(feature["breakout20"], sections["breakout20"]) + 0.20 * zscore(feature["breakout60"], sections["breakout60"]) + 0.25 * zscore(feature["volume_confirmation20"], sections["volume_confirmation20"]),
-                "mean_reversion": 0.45 * zscore(-feature["dist_ma20"], [-v for v in sections["dist_ma20"]]) + 0.25 * zscore(feature["pullback20"], sections["pullback20"]) + 0.30 * zscore(feature["recovery_after_drawdown20"], sections["recovery_after_drawdown20"]),
+                "multi_horizon_momentum": 0.16 * zscore(feature["ret15"], sections["ret15"]) + 0.18 * zscore(feature["ret30"], sections["ret30"]) + 0.24 * zscore(feature["ret60"], sections["ret60"]) + 0.30 * zscore(feature["ret120"], sections["ret120"]) + 0.12 * zscore(feature["relative_strength"], sections["relative_strength"]),
+                "volatility_breakout": 0.45 * zscore(feature["breakout20"], sections["breakout20"]) + 0.30 * zscore(feature["breakout60"], sections["breakout60"]) + 0.25 * zscore(feature["volume_confirmation20"], sections["volume_confirmation20"]),
+                "mean_reversion": 0.30 * zscore(-feature["dist_ma20"], [-v for v in sections["dist_ma20"]]) + 0.25 * zscore(feature["pullback20"], sections["pullback20"]) + 0.20 * zscore(feature["recovery_after_drawdown20"], sections["recovery_after_drawdown20"]) + 0.25 * zscore(feature["rebound_from_low15"], [features[p]["rebound_from_low15"] for p in pairs]),
                 "trend_stability": 0.65 * zscore(feature["trend_stability20"], sections["trend_stability20"]) + 0.35 * zscore(feature["trend_stability60"], sections["trend_stability60"]),
                 "volume_confirmation": 0.55 * zscore(feature["volume_confirmation20"], sections["volume_confirmation20"]) + 0.25 * zscore(feature["volume_z20"], sections["volume_z20"]) + 0.20 * zscore(feature["relative_strength"], sections["relative_strength"]),
             }
@@ -414,20 +437,21 @@ class AlphaModel:
         orthogonalize_signal_maps(signal_map, ["multi_horizon_momentum", "volatility_breakout", "mean_reversion", "trend_stability", "volume_confirmation"])
         preds = self.mu_model.predict(inference_rows)
         pred_z = [zscore(value, preds) for value in preds] if len(preds) >= 2 else [0.0 for _ in preds]
-        core_assets = {
-            item.strip().upper()
-            for item in getattr(self.cfg, "diversification_core_assets", "BTC,ETH").split(",")
-            if item.strip()
-        }
         for idx, pair in enumerate(pairs):
             feature = features[pair]
             for key, value in signal_map[pair].items():
                 feature[key] = value
-            fixed_score = 0.34 * feature["multi_horizon_momentum_ortho"] + 0.18 * feature["volatility_breakout_ortho"] + 0.18 * feature["mean_reversion_ortho"] + 0.16 * feature["trend_stability_ortho"] + 0.14 * feature["volume_confirmation_ortho"]
+            fixed_score = 0.38 * feature["multi_horizon_momentum_ortho"] + 0.22 * feature["volatility_breakout_ortho"] + 0.08 * feature["mean_reversion_ortho"] + 0.18 * feature["trend_stability_ortho"] + 0.14 * feature["volume_confirmation_ortho"]
             if feature["dist_ma20"] > getattr(self.cfg, "max_pump_distance", 0.05):
                 fixed_score -= 0.20 + 2.0 * (feature["dist_ma20"] - getattr(self.cfg, "max_pump_distance", 0.05))
             if feature["spread"] > getattr(self.cfg, "spread_threshold", 0.006) * 0.7:
                 fixed_score -= 0.15 * (feature["spread"] / max(getattr(self.cfg, "spread_threshold", 0.006), 1e-9))
+            fixed_score += 0.06 * zscore(feature["relative_strength"], sections["relative_strength"])
+            base_symbol = pair.split("/")[0].upper()
+            if base_symbol in self.core_assets:
+                fixed_score += 0.02
+            elif self.preferred_assets and base_symbol not in self.preferred_assets:
+                fixed_score -= 0.10
             feature["fixed_score"] = fixed_score
             feature["pred_mu"] = preds[idx] if idx < len(preds) else 0.0
             feature["pred_mu_z"] = pred_z[idx] if idx < len(pred_z) else 0.0
@@ -435,10 +459,10 @@ class AlphaModel:
             agreement = 1.0 / (1.0 + stddev([feature["multi_horizon_momentum_ortho"], feature["volatility_breakout_ortho"], feature["mean_reversion_ortho"], feature["trend_stability_ortho"], feature["volume_confirmation_ortho"]]))
             liquidity_score = clamp(math.log1p(feature["unit_trade_value"] / max(getattr(self.cfg, "min_24h_dollar_vol", 120000.0), 1.0)), 0.0, 1.0)
             spread_score = clamp(1.0 - feature["spread"] / max(getattr(self.cfg, "spread_threshold", 0.006), 1e-9), 0.0, 1.0)
-            feature["confidence"] = clamp(0.45 * min(abs(feature["alpha_score"]) / 2.5, 1.0) + 0.25 * agreement + 0.20 * liquidity_score + 0.10 * spread_score, 0.0, 1.0)
+            feature["confidence"] = clamp(0.42 * min(abs(feature["alpha_score"]) / 2.5, 1.0) + 0.23 * agreement + 0.18 * liquidity_score + 0.09 * spread_score + 0.08 * clamp(feature["trend_stability20"], 0.0, 1.0), 0.0, 1.0)
             feature["score"] = feature["alpha_score"]
             base_symbol = pair.split("/")[0].upper()
-            if base_symbol in core_assets:
+            if base_symbol in self.core_assets:
                 feature["asset_bucket"] = "core"
             elif feature["unit_trade_value"] >= getattr(self.cfg, "liquid_asset_volume_threshold", 400000.0):
                 feature["asset_bucket"] = "liquid"
@@ -765,10 +789,10 @@ def clamp(value: float, lower: float, upper: float) -> float:
 class PortfolioConstructor:
     def __init__(self, cfg: Any):
         self.cfg = cfg
-        self.rank_retention_buffer = 0.25
-        self.holding_bonus_floor = 0.30
+        self.rank_retention_buffer = 0.40
+        self.holding_bonus_floor = 0.36
         self.range_keep_exposure = getattr(cfg, "range_keep_exposure", 0.10)
-        self.pump_chase_cutoff = 0.025
+        self.pump_chase_cutoff = 0.035
         self.pullback_entry_floor = -0.020
 
     def _is_recovery_mode(self, positions: Dict[str, float], direction_regime: str, current_drawdown: float) -> bool:
@@ -790,13 +814,13 @@ class PortfolioConstructor:
         )
 
     def _style_score(self, feature: Dict[str, float], regime: str) -> float:
-        momentum = 0.38 * feature.get("multi_horizon_momentum_ortho", 0.0) + 0.20 * feature.get("volatility_breakout_ortho", 0.0) + 0.18 * feature.get("trend_stability_ortho", 0.0) + 0.14 * feature.get("volume_confirmation_ortho", 0.0) + 0.10 * feature.get("pred_mu_z", 0.0)
-        defensive = 0.38 * feature.get("mean_reversion_ortho", 0.0) + 0.20 * feature.get("trend_stability_ortho", 0.0) + 0.18 * feature.get("volume_confirmation_ortho", 0.0) + 0.14 * (-feature.get("vol60", 0.0)) + 0.10 * feature.get("recovery_after_drawdown20", 0.0)
+        momentum = 0.40 * feature.get("multi_horizon_momentum_ortho", 0.0) + 0.22 * feature.get("volatility_breakout_ortho", 0.0) + 0.18 * feature.get("trend_stability_ortho", 0.0) + 0.12 * feature.get("volume_confirmation_ortho", 0.0) + 0.08 * feature.get("pred_mu_z", 0.0)
+        defensive = 0.30 * feature.get("mean_reversion_ortho", 0.0) + 0.24 * feature.get("trend_stability_ortho", 0.0) + 0.18 * feature.get("volume_confirmation_ortho", 0.0) + 0.16 * (-feature.get("vol60", 0.0)) + 0.12 * feature.get("recovery_after_drawdown20", 0.0)
         if regime == "risk_on":
-            return 0.80 * momentum + 0.20 * defensive
+            return 0.88 * momentum + 0.12 * defensive
         if regime == "risk_off":
-            return 0.35 * momentum + 0.65 * defensive
-        return 0.60 * momentum + 0.40 * defensive
+            return 0.50 * momentum + 0.50 * defensive
+        return 0.72 * momentum + 0.28 * defensive
 
     def _state_score_adjustment(self, feature: Dict[str, float]) -> float:
         state = str(feature.get("setup_state", "neutral"))
@@ -812,10 +836,10 @@ class PortfolioConstructor:
     def _bucket_score_adjustment(self, feature: Dict[str, float], direction_regime: str) -> float:
         bucket = str(feature.get("asset_bucket", "satellite"))
         if bucket == "core":
-            return 0.04
+            return 0.08
         if bucket == "liquid":
-            return 0.01 if direction_regime in {"trend", "neutral"} else -0.01
-        return -0.04 if direction_regime != "trend" else -0.01
+            return 0.03 if direction_regime in {"trend", "neutral"} else -0.01
+        return -0.08 if direction_regime != "trend" else -0.03
 
     def _enforce_bucket_caps(self, weights: Dict[str, float], features: FeatureMap) -> Dict[str, float]:
         if not weights:

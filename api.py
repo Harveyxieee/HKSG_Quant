@@ -171,6 +171,47 @@ class RoostooClient:
             ambiguous_error_message=f"Order submission status unknown for {side} {pair}",
         )
 
+    def place_limit_order(self, pair: str, side: str, quantity: float, price: float) -> Dict[str, Any]:
+        payload = {
+            "pair": pair,
+            "side": side,
+            "type": "LIMIT",
+            "quantity": quantity,
+            "price": price,
+        }
+        return self._request(
+            "POST",
+            "/v3/place_order",
+            params=payload,
+            signed=True,
+            is_post=True,
+            retry_safe=False,
+            ambiguous_error_message=f"Order submission status unknown for {side} {pair}",
+        )
+
+    def query_order(
+        self,
+        *,
+        order_id: Optional[str] = None,
+        pair: Optional[str] = None,
+        pending_only: Optional[bool] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if order_id is not None:
+            payload["order_id"] = str(order_id)
+        else:
+            if pair:
+                payload["pair"] = pair
+            if pending_only is not None:
+                payload["pending_only"] = "TRUE" if pending_only else "FALSE"
+            if offset is not None:
+                payload["offset"] = int(offset)
+            if limit is not None:
+                payload["limit"] = int(limit)
+        return self._request("POST", "/v3/query_order", params=payload, signed=True, is_post=True)
+
     def cancel_order(self, pair: Optional[str] = None, order_id: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         if pair:
